@@ -1,0 +1,12 @@
+# OS / editor cruft
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Node (only if you add tooling later)
+node_modules/
+npm-debug.log*
+
+# Local preview/launch config (safe to commit if you want it shared)
+.claude/

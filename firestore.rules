@@ -1,0 +1,100 @@
+rules_version = '2';
+
+// Firestore security rules for the Science Bowl Question Bank.
+// Deploy with:  firebase deploy --only firestore:rules
+// (or paste into Firebase console → Firestore Database → Rules)
+//
+// Access model: signing up + verifying email is NOT enough. A new account is
+// 'pending' and can read/write NOTHING until an admin approves it (sets the role
+// to writer/reviewer/admin). Bootstrap the first admin once in the Firebase
+// console by editing their users/{uid} doc and setting role: "admin".
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() { return request.auth != null; }
+    function verified() { return signedIn() && request.auth.token.email_verified == true; }
+    function hasProfile() {
+      return signedIn() && exists(/databases/$(database)/documents/users/$(request.auth.uid));
+    }
+    function role() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role;
+    }
+    // Bootstrap admins. KEEP THIS LIST IN SYNC WITH adminEmails IN js/config.js.
+    // These verified emails are admins automatically (so the first admins can set
+    // themselves up just by signing up — no manual console step).
+    function isBootstrapAdmin() {
+      return signedIn() && request.auth.token.email in [
+        'admin@admin.com',
+      ];
+    }
+    function isAdmin() {
+      return verified() && (isBootstrapAdmin() || (hasProfile() && role() == 'admin'));
+    }
+    // An "approved" member: verified email AND (a bootstrap admin OR an
+    // admin-granted role).
+    function isApproved() {
+      return verified() && (isBootstrapAdmin() || (hasProfile() && role() in ['writer', 'reviewer', 'admin']));
+    }
+
+    // ── User profiles ──────────────────────────────────────────────
+    match /users/{uid} {
+      // You can always read your OWN profile (to learn your approval status);
+      // approved members can read the whole roster.
+      allow read: if signedIn() && (request.auth.uid == uid || isApproved());
+
+      // New sign-ups may create only their own profile, and only as 'pending'
+      // (this prevents a stranger from self-granting access).
+      allow create: if signedIn() && request.auth.uid == uid
+        && request.resource.data.role == 'pending';
+
+      // Owners may edit their profile but NOT their own role.
+      // Admins may edit anyone (this is how approval / role changes happen).
+      allow update: if isAdmin()
+        || (signedIn() && request.auth.uid == uid
+            && request.resource.data.role == resource.data.role);
+
+      allow delete: if isAdmin();
+    }
+
+    // ── Questions ──────────────────────────────────────────────────
+    match /questions/{id} {
+      allow read: if isApproved();
+
+      // Authors create their own questions as drafts; admins may bulk-create
+      // (CSV import) on behalf of the "main" account, entering at in_review.
+      allow create: if isApproved() && (
+        (request.resource.data.writerUid == request.auth.uid
+          && request.resource.data.state == 'draft')
+        || (isAdmin() && request.resource.data.state == 'in_review')
+      );
+
+      allow update: if isApproved() && (
+        // Admins may update anything (bulk import fixes / backup restore).
+        isAdmin()
+        ||
+        // The author may edit / submit / resubmit their own question,
+        // but may NOT finalize it themselves.
+        (resource.data.writerUid == request.auth.uid
+          && request.resource.data.state != 'finalized')
+        ||
+        // A reviewer (anyone who is not the author) may perform review actions
+        // and leave suggested edits, touching only workflow fields.
+        (resource.data.writerUid != request.auth.uid
+          && request.resource.data.diff(resource.data).affectedKeys()
+               .hasOnly(['state', 'history', 'finalizedAt', 'updatedAt', 'suggestions']))
+      );
+
+      // Authors may delete their own untouched drafts; admins may delete any.
+      allow delete: if isAdmin()
+        || (isApproved()
+          && resource.data.writerUid == request.auth.uid
+          && resource.data.state == 'draft');
+    }
+
+    // ── Sequential human-friendly ID counter ───────────────────────
+    match /meta/{doc} {
+      allow read, write: if isApproved();
+    }
+  }
+}
