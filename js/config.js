@@ -18,13 +18,18 @@ export const CONFIG = {
   // Paste your Firebase web-app config here (Firebase console → Project settings →
   // "Your apps" → Web app → Config). Only needed when backend = 'firebase'.
   firebase: {
-    ////
+    apiKey: "AIzaSyBmfSTqQJN1UieLtqtqaIt2LVVBE-DQsRY",
+    authDomain: "bsb-writing.firebaseapp.com",
+    projectId: "bsb-writing",
+    storageBucket: "bsb-writing.firebasestorage.app",
+    messagingSenderId: "830675617350",
+    appId: "1:830675617350:web:081d555508a3b2c843ac47"
   },
 
   // Emails listed here are auto-promoted to "admin" the first time they sign up.
   // Admins can manage everyone else's role from the Admin tab.
   adminEmails: [
-    'admin@admin.com'
+    ''
   ],
 
   // Require a verified email before a user can write or review.
