@@ -25,7 +25,7 @@ service cloud.firestore {
     // themselves up just by signing up — no manual console step).
     function isBootstrapAdmin() {
       return signedIn() && request.auth.token.email in [
-        'admin@admin.com',
+        ''
       ];
     }
     function isAdmin() {

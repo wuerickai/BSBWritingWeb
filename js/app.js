@@ -830,24 +830,114 @@ function viewReview() {
   const controls = reviewControls(filters, () => apply());
   const listHost = el('div', { class: 'qlist' });
 
+  let all = [];
+  let current = [];
+  const testsolveBtn = el('button', {
+    class: 'btn ghost', text: '🎯 Testsolve', title: 'Try these questions with the answers hidden',
+    onclick: () => openTestsolve(current),
+  });
+
   host.appendChild(el('div', { class: 'page' }, [
-    el('div', { class: 'page-head' }, [el('h1', { text: 'Review queue' }), el('p', { class: 'muted', text: 'Questions submitted by others. Add suggestions and send back, or approve to finalize.' })]),
+    el('div', { class: 'page-head row-between' }, [
+      el('div', {}, [el('h1', { text: 'Review queue' }), el('p', { class: 'muted', text: 'Questions submitted by others. Add suggestions and send back, or approve to finalize.' })]),
+      testsolveBtn,
+    ]),
     controls, listHost,
   ]));
 
-  let all = [];
   const apply = () => {
-    let rows = all.filter((q) => (!filters.subject || q.subject === filters.subject)
+    current = all.filter((q) => (!filters.subject || q.subject === filters.subject)
       && (!filters.type || q.type === filters.type)
       && (!filters.tub || q.tub === filters.tub)
       && (!filters.difficulty || String(q.difficulty) === filters.difficulty));
-    rows.sort(sorters[filters.sort]);
+    current.sort(sorters[filters.sort]);
+    testsolveBtn.disabled = current.length === 0;
     clear(listHost);
-    if (!rows.length) { listHost.appendChild(emptyState('Nothing to review right now. 🎉')); return; }
-    for (const q of rows) listHost.appendChild(reviewCard(q));
+    if (!current.length) { listHost.appendChild(emptyState('Nothing to review right now. 🎉')); return; }
+    for (const q of current) listHost.appendChild(reviewCard(q));
   };
 
   app.unsub = S().watchQuestions({ states: ['in_review'], excludeWriter: true }, (rows) => { all = rows; apply(); });
+}
+
+// ── Testsolve: try queue questions one at a time with answers hidden ──────────
+function openTestsolve(list) {
+  if (!list || !list.length) { toast('No questions to testsolve right now.'); return; }
+  const queue = list.slice();
+  let i = 0;
+  const guesses = {};   // id -> picked MC slot
+  const revealed = {};  // id -> bool
+  const body = el('div', { class: 'testsolve' });
+
+  const render = () => {
+    const q = queue[i];
+    const isRevealed = !!revealed[q.id];
+    clear(body);
+
+    body.appendChild(el('div', { class: 'ts-bar' }, [
+      el('span', { class: 'ts-count', text: `Question ${i + 1} of ${queue.length}` }),
+      el('div', { class: 'ts-chips' }, [
+        el('span', { class: 'chip', text: `${q.tub} · ${q.type}` }),
+        el('span', { class: 'chip', text: q.subject }),
+        el('span', { class: 'chip subtle', text: q.subcat }),
+        el('span', { class: 'chip subtle', text: 'Diff ' + (q.difficulty ?? '—') }),
+      ]),
+    ]));
+
+    body.appendChild(el('div', { class: 'render-block ts-question', html: renderMixedToString(q.questionText) }));
+
+    if (q.type === 'MC') {
+      const opts = el('div', { class: 'choices' });
+      for (const slot of T.MC_SLOTS) {
+        const picked = guesses[q.id] === slot;
+        const isCorrect = q.mcAnswer === slot;
+        const cls = ['choice', 'ts-choice'];
+        if (!isRevealed) cls.push('pickable');
+        if (!isRevealed && picked) cls.push('picked');
+        if (isRevealed && isCorrect) cls.push('correct');
+        if (isRevealed && picked && !isCorrect) cls.push('wrong');
+        // Before reveal, show every option uppercased so the stored ALL-CAPS
+        // correct answer doesn't give itself away; after reveal, show as stored.
+        const shown = isRevealed ? (q.choices?.[slot] || '') : allCapsPreservingLatex(q.choices?.[slot] || '');
+        const row = el('div', { class: cls.join(' ') }, [
+          el('span', { class: 'choice-key', text: slot }),
+          el('span', { class: 'choice-text', html: renderMixedToString(shown) }),
+          isRevealed && isCorrect ? el('span', { class: 'choice-flag', text: '✓ correct' }) : null,
+          isRevealed && picked && !isCorrect ? el('span', { class: 'choice-flag wrong', text: '✗ your pick' }) : null,
+        ]);
+        if (!isRevealed) row.addEventListener('click', () => { guesses[q.id] = slot; render(); });
+        opts.appendChild(row);
+      }
+      body.appendChild(opts);
+    } else if (q.type === 'SA') {
+      if (!isRevealed) {
+        body.appendChild(el('p', { class: 'muted sm', text: 'Think of (or jot down) your answer, then reveal.' }));
+      } else {
+        body.appendChild(el('div', { class: 'answer-line' }, [el('span', { class: 'answer-key', text: 'Answer:' }), el('span', { html: renderMixedToString(q.answerLine || '') })]));
+      }
+    }
+
+    if (q.type === 'MC' && isRevealed) {
+      const got = guesses[q.id] === q.mcAnswer;
+      body.appendChild(el('div', { class: 'ts-result ' + (guesses[q.id] ? (got ? 'right' : 'miss') : 'none') },
+        [guesses[q.id] ? (got ? '✓ You got it!' : '✗ Not quite.') : `Answer: ${q.mcAnswer}`]));
+    }
+
+    // controls
+    const controls = el('div', { class: 'ts-controls' }, [
+      el('button', { class: 'btn ghost sm', text: '← Prev', disabled: i === 0, onclick: () => { i--; render(); } }),
+      isRevealed
+        ? el('button', { class: 'btn ghost sm', text: 'Hide answer', onclick: () => { revealed[q.id] = false; render(); } })
+        : el('button', { class: 'btn primary', text: 'Reveal answer', onclick: () => { revealed[q.id] = true; render(); } }),
+      el('button', { class: 'btn ghost sm', text: 'Review this →', onclick: () => { m.close(); openReview(q); } }),
+      el('div', { class: 'spacer' }),
+      el('button', { class: 'btn ghost sm', text: 'Next →', disabled: i === queue.length - 1, onclick: () => { i++; render(); } }),
+    ]);
+    body.appendChild(controls);
+  };
+
+  render();
+  const m = modal('Testsolve — answers hidden', body, { wide: true });
 }
 
 // How much review churn a question has accumulated: suggested edits + times it
