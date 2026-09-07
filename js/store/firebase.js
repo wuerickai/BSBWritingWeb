@@ -29,6 +29,33 @@ function effectiveRole(email, profileRole) {
 
 function emitAuth() { authListeners.forEach((fn) => fn(_user)); }
 
+async function userShape(fbUser, profile) {
+  const token = await A.getIdTokenResult(fbUser);
+  const providerIds = fbUser.providerData.map((p) => p.providerId).filter(Boolean);
+  return {
+    uid: fbUser.uid,
+    email: fbUser.email,
+    // Google has already authenticated the user. Treat a current Google session
+    // as verified even if a Workspace-domain account has not yet propagated the
+    // Firebase user-level emailVerified flag.
+    emailVerified: fbUser.emailVerified || token.signInProvider === 'google.com',
+    displayName: profile.displayName || fbUser.displayName || '',
+    initials: profile.initials || '',
+    role: effectiveRole(fbUser.email, profile.role),
+    providerIds,
+  };
+}
+
+function googleProvider(email = '') {
+  const provider = new A.GoogleAuthProvider();
+  provider.setCustomParameters({
+    hd: 'berkeley.edu',
+    prompt: 'select_account',
+    ...(email ? { login_hint: email } : {}),
+  });
+  return provider;
+}
+
 export async function init() {
   const appMod = await import(`https://www.gstatic.com/firebasejs/${V}/firebase-app.js`);
   A = await import(`https://www.gstatic.com/firebasejs/${V}/firebase-auth.js`);
@@ -40,14 +67,7 @@ export async function init() {
   A.onAuthStateChanged(auth, async (fbUser) => {
     if (!fbUser) { _user = null; emitAuth(); return; }
     const profile = await ensureProfile(fbUser);
-    _user = {
-      uid: fbUser.uid,
-      email: fbUser.email,
-      emailVerified: fbUser.emailVerified,
-      displayName: profile.displayName || '',
-      initials: profile.initials || '',
-      role: effectiveRole(fbUser.email, profile.role),
-    };
+    _user = await userShape(fbUser, profile);
     emitAuth();
   });
 }
@@ -94,6 +114,22 @@ export async function signIn({ email, password }) {
   return getCurrentUser();
 }
 
+export async function signInWithGoogle() {
+  await A.signInWithPopup(auth, googleProvider());
+  return reloadUser();
+}
+
+export async function linkGoogleAccount() {
+  const fbUser = auth.currentUser;
+  if (!fbUser) throw new Error('Sign in with your existing account first.');
+  const uid = fbUser.uid;
+  const result = await A.linkWithPopup(fbUser, googleProvider(fbUser.email || ''));
+  if (result.user.uid !== uid) throw new Error('Google linking returned a different account. Your existing account was not replaced.');
+  await result.user.reload();
+  await A.getIdToken(result.user, true);
+  return reloadUser();
+}
+
 export async function signOutUser() { await A.signOut(auth); }
 
 export async function sendVerification() {
@@ -111,7 +147,7 @@ export async function reloadUser() {
     await auth.currentUser.reload();
     const fbUser = auth.currentUser;
     const profile = await ensureProfile(fbUser);
-    _user = { uid: fbUser.uid, email: fbUser.email, emailVerified: fbUser.emailVerified, displayName: profile.displayName || '', initials: profile.initials || '', role: effectiveRole(fbUser.email, profile.role) };
+    _user = await userShape(fbUser, profile);
     emitAuth();
   }
   return _user;

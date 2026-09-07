@@ -30,7 +30,7 @@ function explainError(err) {
     'not-found': 'Firestore database not found — create it in the Firebase console.',
     'failed-precondition': 'Firestore isn’t ready (create the database in the console).',
     'resource-exhausted': 'Firestore quota exceeded for now.',
-    'auth/operation-not-allowed': 'Enable Email/Password under Firebase → Authentication → Sign-in method.',
+    'auth/operation-not-allowed': 'Enable this sign-in provider under Firebase → Authentication → Sign-in method.',
     'auth/unauthorized-domain': 'Add this site’s domain under Firebase → Authentication → Settings → Authorized domains.',
     'auth/network-request-failed': 'Network error reaching Firebase (check your connection / domain).',
     'auth/email-already-in-use': 'That email already has an account — try signing in instead.',
@@ -40,6 +40,11 @@ function explainError(err) {
     'auth/user-not-found': 'No account found with that email.',
     'auth/wrong-password': 'Incorrect password.',
     'auth/too-many-requests': 'Too many attempts — wait a moment and try again.',
+    'auth/account-exists-with-different-credential': 'This email already has an account. Sign in with your password first, then use “Link Google account”.',
+    'auth/credential-already-in-use': 'That Google account is already linked to another user.',
+    'auth/provider-already-linked': 'Google is already linked. Sign out, then choose “Continue with Google”.',
+    'auth/popup-blocked': 'Your browser blocked the Google sign-in popup. Allow popups for this site and try again.',
+    'auth/popup-closed-by-user': 'Google sign-in was canceled before it finished.',
   };
   return hints[code] || (err && err.message) || String(err);
 }
@@ -155,9 +160,18 @@ function renderHeader() {
 
   if (app.user) {
     const roleTag = app.user.role !== 'writer' ? el('span', { class: 'role-tag', text: app.user.role }) : null;
+    const linkGoogle = backendKind() === 'firebase' && S().linkGoogleAccount && !app.user.providerIds?.includes('google.com')
+      ? el('button', { class: 'btn ghost sm', text: 'Link Google', onclick: async (ev) => {
+          ev.target.disabled = true;
+          try { await S().linkGoogleAccount(); toast('Google linked. You can now sign in with Google.', 'success'); }
+          catch (e) { toast(explainError(e), 'error'); }
+          finally { if (ev.target.isConnected) ev.target.disabled = false; }
+        } })
+      : null;
     const menu = el('div', { class: 'usermenu' }, [
       roleTag,
       el('span', { class: 'user-email', text: app.user.email }),
+      linkGoogle,
       el('button', { class: 'btn ghost sm', text: 'Sign out', onclick: async () => { await S().signOutUser(); navigate('write'); } }),
     ]);
     bar.appendChild(menu);
@@ -191,6 +205,15 @@ function renderAuth() {
     const initials = el('input', { class: 'inp', placeholder: 'Writer initials (e.g. HA)', maxLength: 5 });
     const msg = el('div', { class: 'form-msg' });
 
+    const google = backendKind() === 'firebase' && S().signInWithGoogle
+      ? el('button', { class: 'btn ghost block', text: 'Continue with Google', onclick: async (ev) => {
+          msg.className = 'form-msg'; msg.textContent = ''; ev.target.disabled = true;
+          try { await S().signInWithGoogle(); }
+          catch (e) { msg.className = 'form-msg error'; msg.textContent = explainError(e); }
+          finally { if (ev.target.isConnected) ev.target.disabled = false; }
+        } })
+      : null;
+
     const fields = [field('Email', email), field('Password', pw)];
     if (mode === 'up') { fields.push(field('Display name', name), field('Initials', initials)); }
 
@@ -221,7 +244,11 @@ function renderAuth() {
       },
     });
 
-    card.appendChild(el('div', { class: 'auth-body' }, [...fields, msg, submit, mode === 'in' ? forgot : null]));
+    card.appendChild(el('div', { class: 'auth-body' }, [
+      google,
+      google ? el('div', { class: 'auth-divider', text: 'or use email and password' }) : null,
+      ...fields, msg, submit, mode === 'in' ? forgot : null,
+    ]));
   };
   draw();
 
@@ -239,6 +266,22 @@ function renderVerify() {
   const host = clear(view());
   const msg = el('div', { class: 'form-msg' });
   const actions = el('div', { class: 'col-gap' });
+
+  if (backendKind() === 'firebase' && S().linkGoogleAccount && !app.user.providerIds?.includes('google.com')) {
+    actions.appendChild(el('button', {
+      class: 'btn primary', text: 'Link Google account', onclick: async (ev) => {
+        ev.target.disabled = true; msg.className = 'form-msg'; msg.textContent = '';
+        try {
+          const beforeUid = app.user.uid;
+          const user = await S().linkGoogleAccount();
+          if (user?.uid !== beforeUid) throw new Error('Account identity changed unexpectedly.');
+          msg.className = 'form-msg success';
+          msg.textContent = 'Google linked successfully. If this screen remains, sign out and choose “Continue with Google”.';
+        } catch (e) { msg.className = 'form-msg error'; msg.textContent = explainError(e); }
+        finally { if (ev.target.isConnected) ev.target.disabled = false; }
+      },
+    }));
+  }
 
   actions.appendChild(el('button', {
     class: 'btn ghost', text: 'I have verified — refresh', onclick: async () => {
@@ -262,6 +305,8 @@ function renderVerify() {
   host.appendChild(el('div', { class: 'card center-card' }, [
     el('h2', { text: 'Verify your email' }),
     el('p', { html: `We sent a verification link to <strong>${app.user.email}</strong>. Verify it to start writing and reviewing.` }),
+    backendKind() === 'firebase' ? el('p', { class: 'muted sm', text: 'Berkeley account? Link the matching Google account to verify without an email link while keeping this account’s questions and role.' }) : null,
+    el('p', { class: 'muted sm', text: 'If the link says “expired or already used”, your mail provider may have pre-opened it — you might already be verified, so try “I have verified — refresh” first.' }),
     actions, msg,
     el('button', { class: 'linklike', text: 'Sign out', style: 'margin-top:14px', onclick: () => S().signOutUser() }),
   ]));
