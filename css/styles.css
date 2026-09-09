@@ -305,6 +305,32 @@ input[type=file].inp { padding: 8px; font-size: .85rem; }
 .remind-block.warn h4 { color: var(--warn); }
 .remind-conventions li { color: var(--muted); }
 
+/* ── Statistics ─────────────────────────────────────────────────────────────── */
+.stat-tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-bottom: 18px; }
+.stat-tile { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius-sm); padding: 14px 16px; }
+.stat-label { font-size: .78rem; color: var(--muted); margin-bottom: 4px; }
+.stat-value { font-size: 1.7rem; font-weight: 600; line-height: 1.1; }
+.stat-sub { font-size: .76rem; color: var(--muted); margin-top: 4px; }
+.stat-section { font-size: 1.15rem; margin: 30px 0 14px; padding-top: 22px; border-top: 1px solid var(--line); }
+.stat-card { margin-bottom: 16px; padding: 18px 20px; }
+.stat-card h3 { font-size: 1rem; margin-bottom: 14px; }
+.stat-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+.stat-grid .stat-card { margin-bottom: 16px; }
+.bar-list { display: flex; flex-direction: column; gap: 9px; }
+.bar-row { display: grid; grid-template-columns: 170px 1fr; align-items: center; gap: 10px; }
+.bar-label { font-size: .84rem; color: var(--muted); text-align: right; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.bar-area { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.bar-track { height: 20px; min-width: 4px; flex: none; max-width: calc(100% - 56px); background: rgba(108, 140, 255, .16); border-radius: 0 4px 4px 0; }
+.bar-track.plain { background: transparent; }
+.bar-fill { height: 100%; background: var(--primary); border-radius: 0 4px 4px 0; min-width: 2px; }
+.bar-value { font-size: .82rem; color: var(--text); white-space: nowrap; font-variant-numeric: tabular-nums; }
+.diff-tag { color: var(--muted); font-weight: 700; }
+.row-mid { display: flex; align-items: center; gap: 10px; margin-top: 10px; }
+@media (max-width: 720px) {
+  .stat-grid { grid-template-columns: 1fr; }
+  .bar-row { grid-template-columns: 110px 1fr; }
+}
+
 /* KaTeX sizing inside our blocks */
 .katex { font-size: 1.05em; }
 .render-block .katex-display { margin: .4em 0; }

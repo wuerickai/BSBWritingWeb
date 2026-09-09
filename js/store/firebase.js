@@ -10,6 +10,8 @@
 // ────────────────────────────────────────────────────────────────────────────
 
 import { CONFIG } from '../config.js';
+import { mergeEdit } from '../text.js';
+import { allCapsPreservingLatex } from '../latex.js';
 
 const V = '10.12.2';
 let app, auth, db, A, F;        // SDK namespaces
@@ -190,6 +192,7 @@ export async function createQuestion(data) {
     answerLine: data.answerLine || '',
     choices: data.choices || { W: '', X: '', Y: '', Z: '' },
     mcAnswer: data.mcAnswer || '',
+    mcAnswerText: data.mcAnswerText || '',
     difficulty: data.difficulty || null,
     source: data.source || '',
     writerUid: u.uid,
@@ -209,6 +212,15 @@ export async function createQuestion(data) {
 
 export async function updateDraft(id, patch) {
   await F.updateDoc(F.doc(db, 'questions', id), { ...patch, updatedAt: now() });
+}
+
+// Admin edit of any question (including finalized ones). Records a history entry
+// and never changes the question's state. Allowed by firestore.rules for admins.
+export async function adminEdit(id, patch) {
+  const u = requireUser();
+  const q = await getQ(id);
+  const history = (q.history || []).concat({ at: now(), byUid: u.uid, byName: u.displayName || u.email, action: 'edited', comment: '', statusAt: q.status });
+  await F.updateDoc(F.doc(db, 'questions', id), { ...patch, history, updatedAt: now() });
 }
 
 export async function deleteQuestion(id) {
@@ -250,14 +262,14 @@ export async function addComment(id, comment) {
   await F.updateDoc(F.doc(db, 'questions', id), { history, updatedAt: now() });
 }
 
-// ── Suggested edits ───────────────────────────────────────────────────────────
-export async function addTextSuggestion(id, baseText, proposedText) {
+// ── Suggested edits (text, MC choices, difficulty) ───────────────────────────
+export async function addSuggestion(id, payload) {
   const u = requireUser();
   const q = await getQ(id);
   const suggestions = (q.suggestions || []).concat({
     id: Math.random().toString(36).slice(2) + Date.now().toString(36),
     byUid: u.uid, byName: u.displayName || u.email, at: now(),
-    status: 'pending', baseText: baseText ?? q.questionText, proposedText,
+    status: 'pending', ...payload,
   });
   const history = (q.history || []).concat({ at: now(), byUid: u.uid, byName: u.displayName || u.email, action: 'suggestion', comment: '', statusAt: q.status });
   await F.updateDoc(F.doc(db, 'questions', id), { suggestions, history, updatedAt: now() });
@@ -273,7 +285,28 @@ export async function resolveSuggestion(id, sugId, action) {
   if (!s) throw new Error('Suggestion not found.');
   const patch = { suggestions, updatedAt: now() };
   if (action === 'accept') {
-    patch.questionText = s.proposedText;
+    // Merge text edits onto the CURRENT text so multiple accepted suggestions
+    // compose instead of the last one clobbering the earlier ones.
+    if (s.proposedText != null) {
+      patch.questionText = mergeEdit(s.baseText, s.proposedText, q.questionText).text;
+    }
+    if (s.proposedChoices) {
+      patch.choices = { ...(q.choices || {}) };
+      for (const [slot, val] of Object.entries(s.proposedChoices)) patch.choices[slot] = val;
+    }
+    if (s.proposedAnswerLine != null) {
+      patch.answerLine = mergeEdit(s.baseAnswerLine, s.proposedAnswerLine, q.answerLine).text;
+    }
+    if (s.proposedMcAnswer != null) patch.mcAnswer = s.proposedMcAnswer;
+    if (s.proposedDifficulty != null) patch.difficulty = s.proposedDifficulty;
+    // The correct MC choice keeps its natural-case wording; the ALL-CAPS reading
+    // lives separately in mcAnswerText. Recompute it whenever a suggestion
+    // changed the correct choice or its wording.
+    const finalMc = patch.mcAnswer ?? q.mcAnswer;
+    const finalChoices = patch.choices || q.choices || {};
+    if (q.type === 'MC' && finalMc && finalChoices[finalMc] != null) {
+      patch.mcAnswerText = allCapsPreservingLatex(finalChoices[finalMc]);
+    }
     patch.history = (q.history || []).concat({ at: now(), byUid: u.uid, byName: u.displayName || u.email, action: 'suggestion_accepted', comment: '', statusAt: q.status });
   } else if (action === 'reject') {
     patch.history = (q.history || []).concat({ at: now(), byUid: u.uid, byName: u.displayName || u.email, action: 'suggestion_rejected', comment: '', statusAt: q.status });
@@ -304,6 +337,8 @@ export async function bulkImport(questions, owner) {
       tub: data.tub || '', subject: data.subject || '', type: data.type || '', subcat: data.subcat || '',
       questionText: data.questionText || '', answerLine: data.answerLine || '',
       choices: data.choices || { W: '', X: '', Y: '', Z: '' }, mcAnswer: data.mcAnswer || '',
+      mcAnswerText: data.type === 'MC' && data.mcAnswer && data.choices?.[data.mcAnswer]
+        ? allCapsPreservingLatex(data.choices[data.mcAnswer]) : '',
       difficulty: data.difficulty ?? null, source: data.source || '',
       writerUid: owner.uid, writerName: owner.displayName || owner.email,
       writerInitials: (data.writerInitials || owner.initials || '').toUpperCase(),

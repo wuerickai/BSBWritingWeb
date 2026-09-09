@@ -118,6 +118,49 @@ export function hasChanges(oldText, newText) {
   return (oldText || '') !== (newText || '');
 }
 
+// Re-apply a suggestion (base → proposed) on top of `current`, which may have
+// drifted since the suggestion was made (the author edited, or another
+// suggestion was accepted first). Walks the word-diff of base→proposed and
+// replays each change onto `current` by exact-match; pure insertions anchor on
+// the preceding unchanged run. Returns { ok, text } — on any conflict, ok:false
+// and text falls back to the suggestion's own proposedText (caller may warn).
+export function mergeEdit(base, proposed, current) {
+  base = base || ''; proposed = proposed || ''; current = current || '';
+  if (base === current) return { ok: true, text: proposed };   // no drift
+  if (base === proposed) return { ok: true, text: current };   // empty suggestion
+  const segs = diffWords(base, proposed);
+  let result = current;
+  let searchFrom = 0;
+  let prevEq = '';
+  for (let k = 0; k < segs.length; k++) {
+    const seg = segs[k];
+    if (seg.type === 'eq') { prevEq = seg.text; continue; }
+    // coalesce one del/add run
+    let del = '', add = '';
+    while (k < segs.length && segs[k].type !== 'eq') {
+      if (segs[k].type === 'del') del += segs[k].text; else add += segs[k].text;
+      k++;
+    }
+    k--;
+    if (del) {
+      const idx = result.indexOf(del, searchFrom);
+      if (idx === -1) return { ok: false, text: proposed };
+      result = result.slice(0, idx) + add + result.slice(idx + del.length);
+      searchFrom = idx + add.length;
+    } else if (add) {
+      // pure insertion: anchor after the tail of the preceding unchanged text
+      const anchor = prevEq.slice(-30);
+      if (!anchor) { result = add + result; searchFrom = add.length; continue; }
+      const idx = result.indexOf(anchor, searchFrom);
+      if (idx === -1) return { ok: false, text: proposed };
+      const at = idx + anchor.length;
+      result = result.slice(0, at) + add + result.slice(at);
+      searchFrom = at + add.length;
+    }
+  }
+  return { ok: true, text: result };
+}
+
 // ── Format checkers (Science Bowl style conventions) ─────────────────────────
 const NUM_WORDS = { two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8 };
 
@@ -157,7 +200,8 @@ export function checkFormat(d) {
       w.push('Multiple-choice: the question text should contain “which of the following”.');
     }
     for (const slot of ['W', 'X', 'Y', 'Z']) {
-      if (slot === d.mcAnswer) continue; // correct option is intentionally ALL CAPS
+      // Every choice — including the correct one — keeps natural casing now; the
+      // ALL-CAPS answer-key reading is stored separately (mcAnswerText).
       const bad = overCapitalizedWord(d.choices?.[slot]);
       if (bad) w.push(`Choice ${slot}: “${bad}” may be over-capitalized — only the first word and proper nouns should be capitalized.`);
     }

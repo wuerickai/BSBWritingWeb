@@ -7,7 +7,7 @@ import { CONFIG } from './config.js';
 import { initStore, S, backendKind } from './store/index.js';
 import * as T from './taxonomy.js';
 import { validateLatex, validateQuestion, renderInto, renderMixedToString, allCapsPreservingLatex } from './latex.js';
-import { findDuplicates, diffToHtml, hasChanges, checkFormat } from './text.js';
+import { findDuplicates, diffToHtml, hasChanges, checkFormat, mergeEdit } from './text.js';
 import { csvToQuestions } from './csv.js';
 import * as Backup from './backup.js';
 import {
@@ -16,7 +16,7 @@ import {
 
 const app = { user: null, unsub: null, allQuestions: [], allUnsub: null };
 const view = () => document.getElementById('view');
-const ROUTES = ['write', 'mine', 'review', 'finalized', 'admin'];
+const ROUTES = ['write', 'mine', 'review', 'finalized', 'stats', 'admin'];
 
 // ── Bootstrap ─────────────────────────────────────────────────────────────────
 window.addEventListener('DOMContentLoaded', boot);
@@ -144,6 +144,7 @@ function renderHeader() {
       ['mine', '◳ My Questions'],
       ['review', '⚖ Review Queue'],
       ['finalized', '★ Finalized'],
+      ['stats', '𝛴 Statistics'],
     ];
     if (app.user.role === 'admin') tabs.push(['admin', '⚙ Admin']);
     const nav = el('nav', { class: 'tabs' });
@@ -350,6 +351,7 @@ function routeTo(route) {
     case 'mine': return viewMine();
     case 'review': return viewReview();
     case 'finalized': return viewFinalized();
+    case 'stats': return viewStats();
     case 'admin': return app.user.role === 'admin' ? viewAdmin() : viewWrite();
     default: return viewWrite();
   }
@@ -471,7 +473,23 @@ function buildQuestionForm(initial = {}) {
     source: source.value, writerName: writerName.value, writerInitials: writerInitials.value,
   });
 
-  return { node, collect };
+  // Push field values into the live form (used to merge an accepted suggestion
+  // into the author's in-progress edits) and refresh the affected previews.
+  const set = (patch = {}) => {
+    if ('type' in patch) { type.value = patch.type || ''; setType(); }
+    if ('questionText' in patch) { qText.value = patch.questionText || ''; renderInto(qPreview, qText.value); showVal(); updateDupes(); }
+    if ('answerLine' in patch) { answerLine.value = patch.answerLine || ''; renderInto(answerPreview, answerLine.value); }
+    if (patch.choices) {
+      for (const slot of T.MC_SLOTS) if (slot in patch.choices) {
+        choiceInputs[slot].value = patch.choices[slot] || '';
+        renderInto(choicePreviews[slot], choiceInputs[slot].value);
+      }
+    }
+    if ('mcAnswer' in patch) mcAnswer.value = patch.mcAnswer || '';
+    if ('difficulty' in patch) difficulty.value = patch.difficulty != null ? String(patch.difficulty) : '';
+  };
+
+  return { node, collect, set };
 }
 
 function labeled(label, node) {
@@ -504,13 +522,14 @@ function errorBox(errors) {
   ]);
 }
 
-// Auto-formatting applied on save/submit: write the correct MC answer in ALL CAPS
-// (preserving any LaTeX). Returns a new data object; never mutates the original.
+// Auto-formatting applied on save/submit. The correct MC choice keeps its
+// natural-case wording (identical styling to the other options); a separate
+// ALL-CAPS reading of it (LaTeX preserved) is stored in `mcAnswerText` for the
+// answer key. Returns a new data object; never mutates the original.
 function applyAutoFormat(data) {
   const out = { ...data, choices: { ...(data.choices || {}) } };
-  if (out.type === 'MC' && out.mcAnswer && out.choices[out.mcAnswer]) {
-    out.choices[out.mcAnswer] = allCapsPreservingLatex(out.choices[out.mcAnswer]);
-  }
+  out.mcAnswerText = (out.type === 'MC' && out.mcAnswer && out.choices[out.mcAnswer])
+    ? allCapsPreservingLatex(out.choices[out.mcAnswer]) : '';
   return out;
 }
 
@@ -518,7 +537,7 @@ function applyAutoFormat(data) {
 const CONVENTIONS = [
   'Multiple-choice stems include “which of the following”.',
   'In MC options, capitalize only the first word and proper nouns.',
-  'The correct MC answer is saved in ALL CAPS (done automatically).',
+  'All choices — including the correct one — keep their natural casing; a separate ALL-CAPS reading of the correct answer is saved automatically for the answer key.',
   'List questions: “Identify/Select/Rank all of the following <number> … that are <TRUE/…>: 1) …; 2) …; 3) .”',
   'Pronunciations use \\pron{…} → renders as a bold-italic [guide].',
 ];
@@ -555,8 +574,10 @@ function preSubmit(rawData, { excludeId = null, verb = 'Submit' } = {}) {
 
     if (data.type === 'MC' && data.mcAnswer && data.choices[data.mcAnswer]) {
       sections.push(el('div', { class: 'remind-block' }, [
-        el('h4', { text: 'Correct answer will be saved as' }),
+        el('h4', { text: `Correct answer (${data.mcAnswer})` }),
         el('div', { class: 'preview', html: renderMixedToString(data.choices[data.mcAnswer]) }),
+        el('h4', { text: 'Answer-key reading (saved separately, ALL CAPS)', style: 'margin-top:10px' }),
+        el('div', { class: 'preview', html: renderMixedToString(data.mcAnswerText || '') }),
       ]));
     }
 
@@ -625,8 +646,62 @@ function openEditor(q) {
   const titles = { draft: `Edit draft #${q.humanId}`, changes_requested: `Revise question #${q.humanId}`, in_review: `Edit question #${q.humanId}` };
 
   const note = inReview ? el('p', { class: 'muted sm', text: 'This question is in review — your edits are visible to reviewers right away, and the review count won’t change.' }) : null;
-  const body = el('div', {}, [note, form.node, msgHost]);
-  const m = modal(titles[q.state] || `Edit #${q.humanId}`, body, { wide: true });
+
+  // Merge one accepted suggestion into the author's in-progress form values, so
+  // reviewer feedback and the author's own edits combine into a single draft
+  // (rather than one clobbering the other on save).
+  const acceptIntoForm = (cur, s) => {
+    const d = form.collect();
+    const patch = {};
+    if (s.proposedText != null) patch.questionText = mergeEdit(s.baseText, s.proposedText, d.questionText).text;
+    if (s.proposedChoices) patch.choices = { ...s.proposedChoices };
+    if (s.proposedAnswerLine != null) patch.answerLine = mergeEdit(s.baseAnswerLine, s.proposedAnswerLine, d.answerLine).text;
+    if (s.proposedMcAnswer != null) patch.mcAnswer = s.proposedMcAnswer;
+    if (s.proposedDifficulty != null) patch.difficulty = s.proposedDifficulty;
+    form.set(patch);
+  };
+
+  // Live region above the form: reviewer feedback AND pending suggestions,
+  // together and always current. Only this region re-renders on updates — the
+  // form keeps the author's in-progress edits intact.
+  const liveHost = el('div', {});
+  const renderLive = (cur) => {
+    clear(liveHost);
+    if (!cur) return;
+    const notes = (cur.history || []).filter((h) => ['changes_requested', 'comment'].includes(h.action) && h.comment).slice(-3);
+    if (cur.state === 'changes_requested' && notes.length) {
+      liveHost.appendChild(el('div', { class: 'feedback', style: 'margin:0 0 14px' },
+        notes.map((h) => el('div', { style: 'margin:4px 0' }, [
+          el('strong', { text: `${h.byName || 'Reviewer'}: ` }), el('span', { text: h.comment }),
+        ]))));
+    }
+    const pending = (cur.suggestions || []).filter((s) => s.status === 'pending');
+    if (pending.length) {
+      const canResolve = cur.writerUid === app.user.uid && cur.state !== 'finalized';
+      const wrap = el('div', { class: 'suggest-list', style: 'margin:0 0 14px' }, [
+        el('h4', { text: `Suggested edits (${pending.length})` }),
+        canResolve ? el('p', { class: 'muted sm', text: 'Accepting merges the change into your draft below — then save or resubmit to keep it.' }) : null,
+      ]);
+      for (const s of pending) {
+        const actions = el('div', { class: 'row-end gap', style: 'margin-top:8px' });
+        if (canResolve) {
+          actions.appendChild(el('button', { class: 'btn primary sm', text: '✓ Accept', onclick: async () => { acceptIntoForm(cur, s); await S().resolveSuggestion(cur.id, s.id, 'accept'); toast('Suggestion merged into your draft — save to keep it.', 'success'); } }));
+          actions.appendChild(el('button', { class: 'btn ghost sm', text: 'Reject', onclick: async () => { await S().resolveSuggestion(cur.id, s.id, 'reject'); toast('Suggestion rejected.'); } }));
+        }
+        if (s.byUid === app.user.uid) actions.appendChild(el('button', { class: 'btn ghost sm', text: 'Withdraw', onclick: async () => { await S().resolveSuggestion(cur.id, s.id, 'withdraw'); } }));
+        wrap.appendChild(el('div', { class: 'suggest-item' }, [
+          el('div', { class: 'suggest-meta' }, [el('strong', { text: s.byName || 'Reviewer' }), el('span', { class: 'tl-meta', text: ' · ' + fmtDate(s.at) })]),
+          el('div', { class: 'diff-preview', html: suggestionDiffHtml(cur, s) }),
+          actions,
+        ]));
+      }
+      liveHost.appendChild(wrap);
+    }
+  };
+  const stopWatch = S().watchOne(q.id, renderLive);
+
+  const body = el('div', {}, [liveHost, note, form.node, msgHost]);
+  const m = modal(titles[q.state] || `Edit #${q.humanId}`, body, { wide: true, onClose: stopWatch });
 
   const buttons = [];
   if (inReview) {
@@ -666,6 +741,38 @@ function openEditor(q) {
   body.appendChild(el('div', { class: 'row-end gap', style: 'margin-top:18px' }, buttons));
 }
 
+// ── Admin editor: edit ANY question directly, including finalized ones ────────────
+// The question keeps its current state; the change is written straight through and
+// logged in the review history (action: 'edited').
+function openAdminEditor(q) {
+  const form = buildQuestionForm(q);
+  const msgHost = el('div', {});
+  const finish = (errors) => { clear(msgHost); if (errors.length) msgHost.appendChild(errorBox(errors)); };
+  const stateLabel = (STATE_META[q.state]?.label || q.state).toLowerCase();
+
+  const body = el('div', {}, [
+    el('p', { class: 'muted sm', text: `Admin edit of question #${q.humanId}. Changes save directly and are logged in the review history — the question stays ${stateLabel}.` }),
+    form.node, msgHost,
+  ]);
+  const m = modal(`Admin edit · question #${q.humanId}`, body, { wide: true });
+
+  const save = el('button', {
+    class: 'btn primary', text: 'Save changes', onclick: async () => {
+      const d = form.collect();
+      const errors = validateForm(d);
+      finish(errors);
+      if (errors.length) { toast('Fix the highlighted issues first.', 'error'); return; }
+      const formatted = await preSubmit(d, { excludeId: q.id, verb: 'Save' });
+      if (!formatted) return;
+      await S().adminEdit(q.id, formatted);
+      toast('Question updated.', 'success'); m.close();
+    },
+  });
+  body.appendChild(el('div', { class: 'row-end gap', style: 'margin-top:18px' }, [
+    el('button', { class: 'btn ghost', text: 'Cancel', onclick: () => m.close() }), save,
+  ]));
+}
+
 // ── Question detail (read-only render) ───────────────────────────────────────────
 function questionDetail(q) {
   const meta = el('div', { class: 'meta-grid' }, [
@@ -695,13 +802,25 @@ function questionDetail(q) {
     el('h4', { text: 'Question' }), qBody,
     el('h4', { text: q.type === 'MC' ? 'Choices' : 'Answer' }), answerBlock,
   ];
+  if (q.type === 'MC' && q.mcAnswer) {
+    // The correct choice is shown natural-case above; here is its ALL-CAPS
+    // answer-key reading (falling back to a live computation for older records).
+    const caps = q.mcAnswerText || allCapsPreservingLatex(q.choices?.[q.mcAnswer] || '');
+    children.push(
+      el('h4', { text: 'Answer key' }),
+      el('div', { class: 'answer-line' }, [
+        el('span', { class: 'answer-key', text: q.mcAnswer + ':' }),
+        el('span', { html: renderMixedToString(caps) }),
+      ]),
+    );
+  }
   if (q.source) children.push(el('p', { class: 'source-line' }, [el('strong', { text: 'Source: ' }), el('span', { text: q.source })]));
   if (q.history?.length) children.push(el('h4', { text: 'Review history' }), historyTimeline(q.history));
   return el('div', { class: 'detail' }, children);
 }
 
 function historyTimeline(history) {
-  const labels = { submitted: 'Submitted for review', changes_requested: 'Changes requested', finalized: 'Finalized', comment: 'Comment', suggestion: 'Suggested an edit', suggestion_accepted: 'Suggestion accepted', suggestion_rejected: 'Suggestion rejected', imported: 'Imported from spreadsheet' };
+  const labels = { submitted: 'Submitted for review', changes_requested: 'Changes requested', finalized: 'Finalized', comment: 'Comment', suggestion: 'Suggested an edit', suggestion_accepted: 'Suggestion accepted', suggestion_rejected: 'Suggestion rejected', imported: 'Imported from spreadsheet', edited: 'Edited by admin' };
   return el('ul', { class: 'timeline' }, history.slice().reverse().map((h) => el('li', { class: 'tl-item tl-' + h.action }, [
     el('div', { class: 'tl-head' }, [
       el('span', { class: 'tl-action', text: labels[h.action] || h.action }),
@@ -715,16 +834,82 @@ function metaItem(k, v) { return el('div', { class: 'meta-item' }, [el('span', {
 function metaItemNode(k, node) { return el('div', { class: 'meta-item' }, [el('span', { class: 'meta-k', text: k }), el('span', { class: 'meta-v' }, [node])]); }
 
 // ── Suggested edits (Google-Docs / Overleaf style track-changes) ─────────────────
-// Composer: a reviewer edits the question text; the change is shown as a live diff
-// and saved as a pending suggestion the author can accept/reject.
+// Composer: a reviewer edits the question text, MC choice wording, and/or the
+// difficulty; every change is shown as a live diff and saved together as one
+// pending suggestion the author can accept/reject.
 function suggestionComposer(q) {
   const ta = el('textarea', { class: 'inp mono', rows: 4, value: q.questionText || '' });
   const diff = el('div', { class: 'diff-preview' });
   const status = el('div', { class: 'val-status' });
+
+  // MC choice-wording inputs + correct-answer selector (only for MC questions).
+  const choiceInputs = {};
+  let choicesWrap = null;
+  let mcAnswerSel = null;
+  if (q.type === 'MC') {
+    const rows = T.MC_SLOTS.map((slot) => {
+      const inp = el('input', { class: 'inp mono', value: q.choices?.[slot] || '' });
+      choiceInputs[slot] = inp;
+      inp.addEventListener('input', debounce(() => update(), 200));
+      return el('div', { class: 'mc-row' }, [el('span', { class: 'mc-slot', text: slot }), el('div', { class: 'mc-fields' }, [inp])]);
+    });
+    mcAnswerSel = el('select', { class: 'inp sm' });
+    fillSelect(mcAnswerSel, T.MC_SLOTS, { selected: q.mcAnswer, placeholder: '—' });
+    mcAnswerSel.addEventListener('change', () => update());
+    choicesWrap = el('div', {}, [
+      el('div', { class: 'diff-label', text: 'Choice wording' }), el('div', { class: 'mc-grid' }, rows),
+      el('div', { class: 'row-mid' }, [el('span', { class: 'diff-label', style: 'margin:0', text: 'Correct answer' }), mcAnswerSel]),
+    ]);
+  }
+
+  // Short-answer answer-line input (only for SA questions).
+  let answerWrap = null;
+  let ansInput = null;
+  if (q.type === 'SA') {
+    ansInput = el('input', { class: 'inp mono', value: q.answerLine || '' });
+    ansInput.addEventListener('input', debounce(() => update(), 200));
+    answerWrap = el('div', {}, [el('div', { class: 'diff-label', text: 'Answer line' }), ansInput]);
+  }
+
+  // Difficulty suggestion.
+  const diffSel = el('select', { class: 'inp sm' });
+  fillSelect(diffSel, T.DIFFICULTIES, { value: (x) => x.value, label: (x) => x.label, selected: q.difficulty, placeholder: '—' });
+  diffSel.addEventListener('change', () => update());
+
+  const collect = () => {
+    const payload = {};
+    if (hasChanges(q.questionText, ta.value)) { payload.baseText = q.questionText || ''; payload.proposedText = ta.value; }
+    const changedChoices = {};
+    const baseChoices = {};
+    for (const slot of Object.keys(choiceInputs)) {
+      if (hasChanges(q.choices?.[slot], choiceInputs[slot].value)) {
+        changedChoices[slot] = choiceInputs[slot].value;
+        baseChoices[slot] = q.choices?.[slot] || '';
+      }
+    }
+    if (Object.keys(changedChoices).length) { payload.proposedChoices = changedChoices; payload.baseChoices = baseChoices; }
+    if (mcAnswerSel && mcAnswerSel.value && mcAnswerSel.value !== (q.mcAnswer || '')) {
+      payload.baseMcAnswer = q.mcAnswer || ''; payload.proposedMcAnswer = mcAnswerSel.value;
+    }
+    if (ansInput && hasChanges(q.answerLine, ansInput.value)) {
+      payload.baseAnswerLine = q.answerLine || ''; payload.proposedAnswerLine = ansInput.value;
+    }
+    const newDiff = diffSel.value ? Number(diffSel.value) : null;
+    if (newDiff != null && newDiff !== (q.difficulty ?? null)) { payload.baseDifficulty = q.difficulty ?? null; payload.proposedDifficulty = newDiff; }
+    return payload;
+  };
+
   const update = () => {
-    diff.innerHTML = hasChanges(q.questionText, ta.value)
-      ? diffToHtml(q.questionText, ta.value)
-      : '<span class="muted">No changes yet — edit the text above to propose an edit.</span>';
+    const p = collect();
+    const parts = [];
+    if (p.proposedText != null) parts.push(diffToHtml(q.questionText, p.proposedText));
+    for (const slot of Object.keys(p.proposedChoices || {})) {
+      parts.push(`<span class="diff-tag">${slot}:</span> ` + diffToHtml(p.baseChoices[slot], p.proposedChoices[slot]));
+    }
+    if (p.proposedMcAnswer != null) parts.push(`<span class="diff-tag">Correct answer:</span> <del>${q.mcAnswer || '—'}</del> <ins>${p.proposedMcAnswer}</ins>`);
+    if (p.proposedAnswerLine != null) parts.push(`<span class="diff-tag">Answer:</span> ` + diffToHtml(q.answerLine || '', p.proposedAnswerLine));
+    if (p.proposedDifficulty != null) parts.push(`<span class="diff-tag">Difficulty:</span> <del>${q.difficulty ?? '—'}</del> <ins>${p.proposedDifficulty}</ins>`);
+    diff.innerHTML = parts.length ? parts.join('<br>') : '<span class="muted">No changes yet — edit the text, a choice, the correct answer, or the difficulty to propose an edit.</span>';
     const v = validateLatex(ta.value, { allowEmpty: true });
     if (!ta.value.trim()) { status.className = 'val-status'; status.textContent = ''; }
     else if (v.ok) { status.className = 'val-status ok'; status.textContent = '✓ LaTeX valid'; }
@@ -732,20 +917,39 @@ function suggestionComposer(q) {
   };
   ta.addEventListener('input', debounce(update, 200));
   update();
+
   const send = el('button', {
     class: 'btn primary sm', text: 'Send suggestion ✎', onclick: async () => {
-      if (!hasChanges(q.questionText, ta.value)) { toast('Make an edit before sending.', 'error'); return; }
-      await S().addTextSuggestion(q.id, q.questionText, ta.value);
+      const payload = collect();
+      if (!Object.keys(payload).length) { toast('Make an edit before sending.', 'error'); return; }
+      await S().addSuggestion(q.id, payload);
       toast('Suggestion sent to the author.', 'success');
     },
   });
   return el('div', { class: 'suggest-composer' }, [
-    el('h4', { text: 'Suggest an edit to the question text' }),
-    el('p', { class: 'muted sm', text: 'Edit below — your change is tracked (like Google Docs / Overleaf “suggesting”) and the author can accept or reject it. This does not change the question yet.' }),
+    el('h4', { text: 'Suggest an edit' }),
+    el('p', { class: 'muted sm', text: 'Edit the question text, MC choice wording, the correct answer, the short answer, or the difficulty — your changes are tracked (like Google Docs / Overleaf “suggesting”) and the author can accept or reject them. This does not change the question yet.' }),
     ta, status,
+    choicesWrap,
+    answerWrap,
+    el('div', { class: 'row-mid' }, [el('span', { class: 'diff-label', style: 'margin:0', text: 'Difficulty' }), diffSel]),
     el('div', { class: 'diff-label', text: 'Tracked change' }), diff,
     el('div', { class: 'row-end', style: 'margin-top:8px' }, [send]),
   ]);
+}
+
+// Render one suggestion's combined diff (text + choices + difficulty).
+function suggestionDiffHtml(q, s) {
+  const parts = [];
+  if (s.proposedText != null) parts.push(diffToHtml(s.baseText || '', s.proposedText || ''));
+  for (const slot of Object.keys(s.proposedChoices || {})) {
+    const base = (s.baseChoices && s.baseChoices[slot]) || '';
+    parts.push(`<span class="diff-tag">${slot}:</span> ` + diffToHtml(base, s.proposedChoices[slot]));
+  }
+  if (s.proposedMcAnswer != null) parts.push(`<span class="diff-tag">Correct answer:</span> <del>${s.baseMcAnswer || '—'}</del> <ins>${s.proposedMcAnswer}</ins>`);
+  if (s.proposedAnswerLine != null) parts.push(`<span class="diff-tag">Answer:</span> ` + diffToHtml(s.baseAnswerLine || '', s.proposedAnswerLine || ''));
+  if (s.proposedDifficulty != null) parts.push(`<span class="diff-tag">Difficulty:</span> <del>${s.baseDifficulty ?? '—'}</del> <ins>${s.proposedDifficulty}</ins>`);
+  return parts.join('<br>');
 }
 
 // Pure render of the pending suggestions for a question (driven by a live watch).
@@ -755,7 +959,7 @@ function suggestionsSection(q, canResolve) {
   if (!pending.length) { wrap.appendChild(el('p', { class: 'muted sm', text: 'No pending suggestions.' })); return wrap; }
   for (const s of pending) {
     const mine = s.byUid === app.user.uid;
-    const stale = (s.baseText || '') !== (q.questionText || '');
+    const stale = s.proposedText != null && (s.baseText || '') !== (q.questionText || '');
     const actions = el('div', { class: 'row-end gap', style: 'margin-top:8px' });
     if (canResolve) {
       actions.appendChild(el('button', { class: 'btn primary sm', text: '✓ Accept', onclick: async () => { await S().resolveSuggestion(q.id, s.id, 'accept'); toast('Suggestion applied.', 'success'); } }));
@@ -763,8 +967,8 @@ function suggestionsSection(q, canResolve) {
     }
     if (mine) actions.appendChild(el('button', { class: 'btn ghost sm', text: 'Withdraw', onclick: async () => { await S().resolveSuggestion(q.id, s.id, 'withdraw'); } }));
     wrap.appendChild(el('div', { class: 'suggest-item' }, [
-      el('div', { class: 'suggest-meta' }, [el('strong', { text: s.byName || 'Reviewer' }), el('span', { class: 'tl-meta', text: ' · ' + fmtDate(s.at) }), stale ? el('span', { class: 'chip warn', text: 'based on older text' }) : null]),
-      el('div', { class: 'diff-preview', html: diffToHtml(s.baseText || '', s.proposedText || '') }),
+      el('div', { class: 'suggest-meta' }, [el('strong', { text: s.byName || 'Reviewer' }), el('span', { class: 'tl-meta', text: ' · ' + fmtDate(s.at) }), stale ? el('span', { class: 'chip warn', text: 'text moved on — will be merged' }) : null]),
+      el('div', { class: 'diff-preview', html: suggestionDiffHtml(q, s) }),
       actions,
     ]));
   }
@@ -818,16 +1022,15 @@ function myCard(q) {
   const pend = pendingCount(q);
   const actions = el('div', { class: 'card-actions' });
 
+  // A single editor now carries BOTH the reviewer's feedback and any pending
+  // suggested edits together, so one button covers whatever needs attention.
   if (q.state === 'changes_requested') {
-    actions.appendChild(el('button', { class: 'btn primary sm', text: 'Revise & resubmit', onclick: () => openEditor(q) }));
-  } else if (pend > 0) {
-    actions.appendChild(el('button', { class: 'btn primary sm', text: 'Resolve suggestions', onclick: () => openMyQuestion(q) }));
-    actions.appendChild(el('button', { class: 'btn ghost sm', text: 'Edit', onclick: () => openEditor(q) }));
+    actions.appendChild(el('button', { class: 'btn primary sm', text: pend > 0 ? 'Revise, resolve & resubmit' : 'Revise & resubmit', onclick: () => openEditor(q) }));
   } else if (q.state === 'draft') {
     actions.appendChild(el('button', { class: 'btn primary sm', text: 'Edit', onclick: () => openEditor(q) }));
     actions.appendChild(el('button', { class: 'btn danger sm', text: 'Delete', onclick: async () => { if (await confirmDialog('Delete this draft?', { danger: true, confirmText: 'Delete' })) { await S().deleteQuestion(q.id); toast('Draft deleted.'); } } }));
   } else if (q.state === 'in_review') {
-    actions.appendChild(el('button', { class: 'btn primary sm', text: 'Edit', onclick: () => openEditor(q) }));
+    actions.appendChild(el('button', { class: 'btn primary sm', text: pend > 0 ? 'Edit & resolve suggestions' : 'Edit', onclick: () => openEditor(q) }));
   }
   actions.appendChild(el('button', { class: 'btn ghost sm', text: 'View', onclick: () => openMyQuestion(q) }));
 
@@ -941,8 +1144,8 @@ function openTestsolve(list) {
         if (!isRevealed && picked) cls.push('picked');
         if (isRevealed && isCorrect) cls.push('correct');
         if (isRevealed && picked && !isCorrect) cls.push('wrong');
-        // Before reveal, show every option uppercased so the stored ALL-CAPS
-        // correct answer doesn't give itself away; after reveal, show as stored.
+        // Before reveal, show every option uppercased so casing can't hint at
+        // the answer; after reveal, show each choice in its natural stored case.
         const shown = isRevealed ? (q.choices?.[slot] || '') : allCapsPreservingLatex(q.choices?.[slot] || '');
         const row = el('div', { class: cls.join(' ') }, [
           el('span', { class: 'choice-key', text: slot }),
@@ -1167,7 +1370,10 @@ function renderTable(host, rows) {
       el('td', { text: q.status }),
       el('td', { text: q.writerInitials || '—' }),
       el('td', { class: 'q-cell', text: text + (q.questionText && q.questionText.length > 90 ? '…' : '') }),
-      el('td', {}, [el('button', { class: 'btn ghost xs', text: 'View', onclick: () => modal(`Question #${q.humanId}`, questionDetail(q), { wide: true }) })]),
+      el('td', { class: 'nowrap-sm' }, [
+        el('button', { class: 'btn ghost xs', text: 'View', onclick: () => modal(`Question #${q.humanId}`, questionDetail(q), { wide: true }) }),
+        app.user.role === 'admin' ? el('button', { class: 'btn ghost xs', text: 'Edit', style: 'margin-left:6px', onclick: () => openAdminEditor(q) }) : null,
+      ]),
     ]);
   }));
   host.appendChild(el('table', { class: 'qtable' }, [el('thead', {}, [head]), body]));
@@ -1179,10 +1385,14 @@ function csvEscape(v) {
   return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
 }
 function downloadCsv(rows) {
-  const headers = ['TU/B', 'Subject', 'Type', 'Subcat', 'Question Text', 'IF SA - Answer Line', 'W', 'X', 'Y', 'Z', 'IF MC - Answer', 'Difficulty', 'Status', 'ID', 'Source', 'Writer Initials'];
+  const headers = ['TU/B', 'Subject', 'Type', 'Subcat', 'Question Text', 'IF SA - Answer Line', 'W', 'X', 'Y', 'Z', 'IF MC - Answer', 'IF MC - Answer Text', 'Difficulty', 'Status', 'ID', 'Source', 'Writer Initials'];
   const lines = [headers.join(',')];
   for (const q of rows) {
-    lines.push([q.tub, q.subject, q.type, q.subcat, q.questionText, q.type === 'SA' ? q.answerLine : '', q.choices?.W, q.choices?.X, q.choices?.Y, q.choices?.Z, q.type === 'MC' ? q.mcAnswer : '', q.difficulty, q.status, q.humanId, q.source, q.writerInitials].map(csvEscape).join(','));
+    // The ALL-CAPS answer-key reading of the correct choice (falls back to a live
+    // computation for records saved before mcAnswerText existed).
+    const mcAnswerText = q.type === 'MC'
+      ? (q.mcAnswerText || allCapsPreservingLatex(q.choices?.[q.mcAnswer] || '')) : '';
+    lines.push([q.tub, q.subject, q.type, q.subcat, q.questionText, q.type === 'SA' ? q.answerLine : '', q.choices?.W, q.choices?.X, q.choices?.Y, q.choices?.Z, q.type === 'MC' ? q.mcAnswer : '', mcAnswerText, q.difficulty, q.status, q.humanId, q.source, q.writerInitials].map(csvEscape).join(','));
   }
   triggerDownload(new Blob([lines.join('\n')], { type: 'text/csv' }), 'finalized-questions.csv');
 }
@@ -1192,6 +1402,175 @@ function downloadJson(rows) {
 function triggerDownload(blob, name) {
   const a = el('a', { href: URL.createObjectURL(blob), download: name });
   document.body.appendChild(a); a.click(); a.remove();
+}
+
+// ── View: Statistics ──────────────────────────────────────────────────────────────
+// Summary of the whole bank: headline tiles, per-subject progress toward
+// finalized, and finalized breakdowns by difficulty / type / writer.
+function viewStats() {
+  const host = clear(view());
+  const content = el('div', {});
+  host.appendChild(el('div', { class: 'page' }, [
+    el('div', { class: 'page-head' }, [el('h1', { text: 'Statistics' }), el('p', { class: 'muted', text: 'Where the question bank stands — written, in review, and finalized.' })]),
+    content,
+  ]));
+
+  const draw = () => {
+    const all = app.allQuestions || [];
+    const fin = all.filter((q) => q.state === 'finalized');
+    const byState = (st) => all.filter((q) => q.state === st).length;
+    const pendingSugs = all.reduce((n, q) => n + (q.suggestions || []).filter((s) => s.status === 'pending').length, 0);
+
+    clear(content);
+    if (!all.length) { content.appendChild(emptyState('No questions yet — statistics will appear once writing starts.', 'Write the first one', () => navigate('write'))); return; }
+
+    // ── Headline tiles ──
+    const tile = (label, value, sub) => el('div', { class: 'stat-tile' }, [
+      el('div', { class: 'stat-label', text: label }),
+      el('div', { class: 'stat-value', text: String(value) }),
+      sub ? el('div', { class: 'stat-sub', text: sub }) : null,
+    ]);
+    content.appendChild(el('div', { class: 'stat-tiles' }, [
+      tile('Total questions', all.length),
+      tile('Finalized', fin.length, all.length ? Math.round((fin.length / all.length) * 100) + '% of bank' : null),
+      tile('In review', byState('in_review')),
+      tile('Needing revision', byState('changes_requested')),
+      tile('Drafts', byState('draft')),
+      tile('Pending suggestions', pendingSugs),
+    ]));
+
+    // ── Per-subject progress (finalized vs total) ──
+    const countBy = (rows, key) => {
+      const m = new Map();
+      for (const q of rows) { const k = key(q) || '—'; m.set(k, (m.get(k) || 0) + 1); }
+      return m;
+    };
+    const subjTotal = countBy(all, (q) => q.subject);
+    const subjFin = countBy(fin, (q) => q.subject);
+    const subjects = T.SUBJECTS.filter((s) => subjTotal.has(s)).concat([...subjTotal.keys()].filter((s) => !T.SUBJECTS.includes(s)));
+    const maxSubj = Math.max(...subjects.map((s) => subjTotal.get(s) || 0), 1);
+    content.appendChild(el('div', { class: 'card stat-card' }, [
+      el('h3', { text: 'By subject — finalized vs written' }),
+      el('div', { class: 'bar-list' }, subjects.map((s) => {
+        const total = subjTotal.get(s) || 0, f = subjFin.get(s) || 0;
+        return el('div', { class: 'bar-row' }, [
+          el('span', { class: 'bar-label', text: s }),
+          el('div', { class: 'bar-area' }, [
+            el('div', { class: 'bar-track', style: `width:${(total / maxSubj) * 100}%` }, [
+              el('div', { class: 'bar-fill', style: `width:${total ? (f / total) * 100 : 0}%` }),
+            ]),
+            el('span', { class: 'bar-value', text: `${f} / ${total}` }),
+          ]),
+        ]);
+      })),
+      el('p', { class: 'muted sm', style: 'margin:10px 0 0', text: 'Filled portion = finalized; full track = all written questions in that subject.' }),
+    ]));
+
+    // ── Finalized breakdowns ──
+    const barChart = (title, entries, denomLabel) => {
+      const max = Math.max(...entries.map(([, n]) => n), 1);
+      return el('div', { class: 'card stat-card' }, [
+        el('h3', { text: title }),
+        entries.length
+          ? el('div', { class: 'bar-list' }, entries.map(([label, n]) => el('div', { class: 'bar-row' }, [
+              el('span', { class: 'bar-label', text: label, title: label }),
+              el('div', { class: 'bar-area' }, [
+                el('div', { class: 'bar-track plain', style: `width:${(n / max) * 100}%` }, [el('div', { class: 'bar-fill', style: 'width:100%' })]),
+                el('span', { class: 'bar-value', text: String(n) }),
+              ]),
+            ])))
+          : el('p', { class: 'muted sm', text: `No ${denomLabel} yet.` }),
+      ]);
+    };
+
+    const diffLabels = Object.fromEntries(T.DIFFICULTIES.map((d) => [String(d.value), d.label]));
+    const byDiff = [...countBy(fin, (q) => String(q.difficulty ?? '—')).entries()]
+      .sort((a, b) => (a[0] === '—' ? 99 : +a[0]) - (b[0] === '—' ? 99 : +b[0]))
+      .map(([k, n]) => [diffLabels[k] ? `${k} — ${diffLabels[k]}` : k, n]);
+
+    const byType = [...countBy(fin, (q) => `${q.tub || '?'} · ${q.type || '?'}`).entries()].sort((a, b) => b[1] - a[1]);
+
+    const byWriter = [...countBy(fin, (q) => q.writerInitials || '—').entries()].sort((a, b) => b[1] - a[1]).slice(0, 12);
+
+    content.appendChild(el('div', { class: 'stat-grid' }, [
+      barChart('Finalized by difficulty', byDiff, 'finalized questions'),
+      barChart('Finalized by round type', byType, 'finalized questions'),
+    ]));
+    content.appendChild(barChart('Finalized by writer', byWriter, 'finalized questions'));
+
+    // ── Review activity (across submitted + finalized questions) ──
+    const submitted = all.filter((q) => q.state !== 'draft');   // ever entered review
+    const changeReqTotal = all.reduce((n, q) => n + (q.history || []).filter((h) => h.action === 'changes_requested').length, 0);
+
+    // Review rounds (status) for finalized questions.
+    const finRounds = fin.map((q) => q.status || 0).filter((n) => n > 0);
+    const avgRounds = finRounds.length ? finRounds.reduce((a, b) => a + b, 0) / finRounds.length : 0;
+    const firstPass = finRounds.filter((n) => n === 1).length;
+    const roundsDist = countBy(fin.filter((q) => (q.status || 0) > 0), (q) => (q.status >= 4 ? '4+' : String(q.status)));
+
+    // Suggestion outcomes across every question.
+    const sugStatus = { pending: 0, accepted: 0, rejected: 0, withdrawn: 0 };
+    for (const q of all) for (const s of (q.suggestions || [])) sugStatus[s.status] = (sugStatus[s.status] || 0) + 1;
+    const totalSug = Object.values(sugStatus).reduce((a, b) => a + b, 0);
+
+    // Per-reviewer activity from history + suggestions.
+    const reviewerActivity = new Map();
+    const bump = (name, key) => {
+      const nm = name || '—';
+      const r = reviewerActivity.get(nm) || { suggestions: 0, changes: 0, finalized: 0, comments: 0 };
+      r[key]++; reviewerActivity.set(nm, r);
+    };
+    for (const q of all) {
+      for (const s of (q.suggestions || [])) bump(s.byName, 'suggestions');
+      for (const h of (q.history || [])) {
+        if (h.action === 'changes_requested') bump(h.byName, 'changes');
+        else if (h.action === 'finalized') bump(h.byName, 'finalized');
+        else if (h.action === 'comment') bump(h.byName, 'comments');
+      }
+    }
+    const reviewerRows = [...reviewerActivity.entries()]
+      .map(([name, r]) => [name, r, r.suggestions + r.changes + r.finalized + r.comments])
+      .sort((a, b) => b[2] - a[2]).slice(0, 12);
+
+    content.appendChild(el('h2', { class: 'stat-section', text: 'Review activity' }));
+    content.appendChild(el('div', { class: 'stat-tiles' }, [
+      tile('Submitted (ever reviewed)', submitted.length),
+      tile('In review now', byState('in_review')),
+      tile('Avg reviews to finalize', avgRounds ? avgRounds.toFixed(1) : '—', fin.length ? `${firstPass} finalized first-pass` : null),
+      tile('Change requests', changeReqTotal),
+      tile('Suggestions', totalSug, totalSug ? `${sugStatus.accepted} accepted · ${sugStatus.pending} pending` : null),
+    ]));
+
+    const roundsEntries = [...roundsDist.entries()]
+      .sort((a, b) => (a[0] === '4+' ? 4 : +a[0]) - (b[0] === '4+' ? 4 : +b[0]))
+      .map(([k, n]) => [k === '1' ? '1 review' : `${k} reviews`, n]);
+    const sugEntries = [['Accepted', sugStatus.accepted], ['Rejected', sugStatus.rejected], ['Pending', sugStatus.pending], ['Withdrawn', sugStatus.withdrawn]].filter(([, n]) => n > 0);
+    content.appendChild(el('div', { class: 'stat-grid' }, [
+      barChart('Reviews to finalize', roundsEntries, 'finalized questions'),
+      barChart('Suggestions by outcome', sugEntries, 'suggestions'),
+    ]));
+
+    content.appendChild(el('div', { class: 'card stat-card' }, [
+      el('h3', { text: 'Reviewer activity' }),
+      reviewerRows.length
+        ? el('div', { class: 'table-host' }, [el('table', { class: 'qtable' }, [
+            el('thead', {}, [el('tr', {}, ['Reviewer', 'Suggestions', 'Changes requested', 'Finalized', 'Comments'].map((h) => el('th', { text: h })))]),
+            el('tbody', {}, reviewerRows.map(([name, r]) => el('tr', {}, [
+              el('td', { text: name }),
+              el('td', { text: String(r.suggestions) }),
+              el('td', { text: String(r.changes) }),
+              el('td', { text: String(r.finalized) }),
+              el('td', { text: String(r.comments) }),
+            ]))),
+          ])])
+        : el('p', { class: 'muted sm', text: 'No review activity yet.' }),
+    ]));
+  };
+
+  draw();
+  const onData = () => { if (currentRoute() === 'stats') draw(); };
+  document.addEventListener('sbq-allquestions', onData);
+  app.unsub = () => document.removeEventListener('sbq-allquestions', onData);
 }
 
 // ── View: Admin (sub-tabs: Users / Import / Backups) ─────────────────────────────
