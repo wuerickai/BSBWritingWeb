@@ -89,6 +89,13 @@ service cloud.firestore {
         (resource.data.writerUid != request.auth.uid
           && request.resource.data.diff(resource.data).affectedKeys()
                .hasOnly(['state', 'history', 'finalizedAt', 'updatedAt', 'suggestions']))
+        ||
+        // Graveyard: any approved user may archive/restore a NON-finalized
+        // question (touching only the archive flag + audit fields). Finalized
+        // questions can only be archived by admins (the isAdmin branch above).
+        (resource.data.state != 'finalized'
+          && request.resource.data.diff(resource.data).affectedKeys()
+               .hasOnly(['archived', 'archivedAt', 'archivedBy', 'archivedByName', 'archivedReason', 'history', 'updatedAt']))
       );
 
       // Authors may delete their own untouched drafts; admins may delete any.

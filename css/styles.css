@@ -189,6 +189,9 @@ select.inp { appearance: none; background-image: url("data:image/svg+xml,%3Csvg 
 .st-review { background: rgba(108, 140, 255, .2); color: var(--primary); }
 .st-changes { background: rgba(246, 185, 85, .2); color: var(--warn); }
 .st-final { background: rgba(52, 211, 166, .18); color: var(--accent); }
+.st-archived { background: rgba(240, 97, 122, .16); color: var(--danger); }
+.qcard.archived { opacity: .82; }
+.qcard.archived .feedback { border-left-color: var(--danger); background: rgba(240, 97, 122, .08); }
 
 .empty { text-align: center; color: var(--muted); padding: 50px 20px; border: 1px dashed var(--line); border-radius: var(--radius); display: flex; flex-direction: column; gap: 14px; align-items: center; }
 

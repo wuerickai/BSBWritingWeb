@@ -227,6 +227,30 @@ export async function deleteQuestion(id) {
   await F.deleteDoc(F.doc(db, 'questions', id));
 }
 
+// ── Graveyard (soft-remove) ───────────────────────────────────────────────────
+// Archive keeps the record (and its original `state`) but takes it out of every
+// list; restore puts it back. firestore.rules allows any approved user to
+// archive/restore a NON-finalized question and reserves finalized ones to admins.
+export async function archiveQuestion(id, reason) {
+  const u = requireUser();
+  const q = await getQ(id);
+  const history = (q.history || []).concat({ at: now(), byUid: u.uid, byName: u.displayName || u.email, action: 'archived', comment: reason || '', statusAt: q.status });
+  await F.updateDoc(F.doc(db, 'questions', id), {
+    archived: true, archivedAt: now(), archivedBy: u.uid, archivedByName: u.displayName || u.email, archivedReason: reason || '',
+    history, updatedAt: now(),
+  });
+}
+
+export async function restoreQuestion(id) {
+  const u = requireUser();
+  const q = await getQ(id);
+  const history = (q.history || []).concat({ at: now(), byUid: u.uid, byName: u.displayName || u.email, action: 'restored', comment: '', statusAt: q.status });
+  await F.updateDoc(F.doc(db, 'questions', id), {
+    archived: false, archivedAt: null, archivedBy: null, archivedReason: '',
+    history, updatedAt: now(),
+  });
+}
+
 async function getQ(id) {
   const snap = await F.getDoc(F.doc(db, 'questions', id));
   if (!snap.exists()) throw new Error('Question not found.');
@@ -383,6 +407,10 @@ export function watchQuestions(filter, cb) {
   const q = clauses.length ? F.query(col, ...clauses) : F.query(col);
   return F.onSnapshot(q, (snap) => {
     let arr = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+    // Archived questions live only in the Graveyard. `archived` may be missing on
+    // older docs, so filter client-side rather than with a where() clause.
+    if (filter.archived) arr = arr.filter((x) => x.archived === true);
+    else if (!filter.includeArchived) arr = arr.filter((x) => !x.archived);
     if (filter.excludeWriter && _user && CONFIG.hideOwnQuestionsFromReviewer) arr = arr.filter((x) => x.writerUid !== _user.uid);
     arr.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
     cb(arr);

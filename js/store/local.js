@@ -225,6 +225,36 @@ export async function deleteQuestion(id) {
   saveQuestions(arr);
 }
 
+// ── Graveyard (soft-remove) ───────────────────────────────────────────────────
+// Archiving takes a question out of the writing/review/finalized lists WITHOUT
+// deleting it: the record (and its original `state`) is kept so it can be
+// restored later. Removing a finalized question is admin-only — enforced in the
+// UI and, for the firebase backend, in firestore.rules.
+export async function archiveQuestion(id, reason) {
+  const u = requireUser();
+  return mutate(id, (q) => {
+    q.archived = true;
+    q.archivedAt = now();
+    q.archivedBy = u.uid;
+    q.archivedByName = u.displayName || u.email;
+    q.archivedReason = reason || '';
+    q.history = q.history || [];
+    q.history.push({ at: now(), byUid: u.uid, byName: u.displayName || u.email, action: 'archived', comment: reason || '', statusAt: q.status });
+  });
+}
+
+export async function restoreQuestion(id) {
+  const u = requireUser();
+  return mutate(id, (q) => {
+    q.archived = false;
+    q.archivedAt = null;
+    q.archivedBy = null;
+    q.archivedReason = '';
+    q.history = q.history || [];
+    q.history.push({ at: now(), byUid: u.uid, byName: u.displayName || u.email, action: 'restored', comment: '', statusAt: q.status });
+  });
+}
+
 export async function submitForReview(id, patch = null) {
   const u = requireUser();
   return mutate(id, (q) => {
@@ -372,11 +402,15 @@ export function watchOne(id, cb) {
   return () => dataListeners.delete(run);
 }
 
-// Filtered live subscription. filter keys: mine, excludeWriter, finalized, states[]
+// Filtered live subscription. filter keys: mine, excludeWriter, finalized,
+// states[], archived (only graveyard), includeArchived (keep archived in the
+// results). By default archived questions are hidden from every list.
 export function watchQuestions(filter, cb) {
   const run = () => {
     const u = _user;
     let arr = allQuestions();
+    if (filter.archived) arr = arr.filter((q) => q.archived);
+    else if (!filter.includeArchived) arr = arr.filter((q) => !q.archived);
     if (filter.mine && u) arr = arr.filter((q) => q.writerUid === u.uid);
     if (filter.excludeWriter && u && CONFIG.hideOwnQuestionsFromReviewer) arr = arr.filter((q) => q.writerUid !== u.uid);
     if (filter.finalized) arr = arr.filter((q) => q.state === 'finalized');

@@ -16,7 +16,12 @@ import {
 
 const app = { user: null, unsub: null, allQuestions: [], allUnsub: null };
 const view = () => document.getElementById('view');
-const ROUTES = ['write', 'mine', 'review', 'finalized', 'stats', 'admin'];
+const ROUTES = ['write', 'mine', 'review', 'finalized', 'stats', 'graveyard', 'admin'];
+
+// Questions that still count as "live" — everything not moved to the Graveyard.
+// The global feed keeps archived questions (so they stay backed up); dedupe and
+// statistics work off this filtered view instead.
+const activeQuestions = () => (app.allQuestions || []).filter((q) => !q.archived);
 
 // ── Bootstrap ─────────────────────────────────────────────────────────────────
 window.addEventListener('DOMContentLoaded', boot);
@@ -92,7 +97,7 @@ function cleanupSub() { if (app.unsub) { try { app.unsub(); } catch {} app.unsub
 let _backupStarted = false;
 function startGlobal() {
   if (app.allUnsub) return;
-  app.allUnsub = S().watchQuestions({}, (rows) => {
+  app.allUnsub = S().watchQuestions({ includeArchived: true }, (rows) => {
     app.allQuestions = rows;
     Backup.markDirty();
     document.dispatchEvent(new CustomEvent('sbq-allquestions'));
@@ -145,6 +150,7 @@ function renderHeader() {
       ['review', '⚖ Review Queue'],
       ['finalized', '★ Finalized'],
       ['stats', '𝛴 Statistics'],
+      ['graveyard', '🪦 Graveyard'],
     ];
     if (app.user.role === 'admin') tabs.push(['admin', '⚙ Admin']);
     const nav = el('nav', { class: 'tabs' });
@@ -352,6 +358,7 @@ function routeTo(route) {
     case 'review': return viewReview();
     case 'finalized': return viewFinalized();
     case 'stats': return viewStats();
+    case 'graveyard': return viewGraveyard();
     case 'admin': return app.user.role === 'admin' ? viewAdmin() : viewWrite();
     default: return viewWrite();
   }
@@ -424,7 +431,7 @@ function buildQuestionForm(initial = {}) {
   // Duplicate detection panel.
   const dupHost = el('div', { class: 'dup-host' });
   const updateDupes = () => {
-    const matches = findDuplicates(qText.value, app.allQuestions, { threshold: CONFIG.duplicate.show, excludeId: initial.id || null, limit: 4 });
+    const matches = findDuplicates(qText.value, activeQuestions(), { threshold: CONFIG.duplicate.show, excludeId: initial.id || null, limit: 4 });
     clear(dupHost);
     if (!matches.length) return;
     dupHost.appendChild(el('div', { class: 'dup-box' }, [
@@ -548,7 +555,7 @@ const CONVENTIONS = [
 function preSubmit(rawData, { excludeId = null, verb = 'Submit' } = {}) {
   const data = applyAutoFormat(rawData);
   const warnings = checkFormat(data);
-  const dups = findDuplicates(data.questionText, app.allQuestions, { threshold: CONFIG.duplicate.confirm, excludeId, limit: 3 });
+  const dups = findDuplicates(data.questionText, activeQuestions(), { threshold: CONFIG.duplicate.confirm, excludeId, limit: 3 });
 
   return new Promise((resolve) => {
     const sections = [];
@@ -820,7 +827,7 @@ function questionDetail(q) {
 }
 
 function historyTimeline(history) {
-  const labels = { submitted: 'Submitted for review', changes_requested: 'Changes requested', finalized: 'Finalized', comment: 'Comment', suggestion: 'Suggested an edit', suggestion_accepted: 'Suggestion accepted', suggestion_rejected: 'Suggestion rejected', imported: 'Imported from spreadsheet', edited: 'Edited by admin' };
+  const labels = { submitted: 'Submitted for review', changes_requested: 'Changes requested', finalized: 'Finalized', comment: 'Comment', suggestion: 'Suggested an edit', suggestion_accepted: 'Suggestion accepted', suggestion_rejected: 'Suggestion rejected', imported: 'Imported from spreadsheet', edited: 'Edited by admin', archived: 'Removed to graveyard', restored: 'Restored from graveyard' };
   return el('ul', { class: 'timeline' }, history.slice().reverse().map((h) => el('li', { class: 'tl-item tl-' + h.action }, [
     el('div', { class: 'tl-head' }, [
       el('span', { class: 'tl-action', text: labels[h.action] || h.action }),
@@ -991,6 +998,98 @@ function openMyQuestion(qInit) {
   modal(`Question #${qInit.humanId}`, body, { wide: true, onClose: stop });
 }
 
+// ── Graveyard (soft-remove) ───────────────────────────────────────────────────
+// Who may archive / restore a question: finalized ones are admin-only; anything
+// still in the writing/review pipeline can be removed by its author or by a
+// reviewer/admin. Restore uses the question's preserved original state.
+function canArchive(q) {
+  if (q.state === 'finalized') return app.user.role === 'admin';
+  return q.writerUid === app.user.uid || ['reviewer', 'admin'].includes(app.user.role);
+}
+
+// A small modal that captures an optional reason, then archives the question.
+// `onDone` fires after success (used to close a parent modal).
+function archiveDialog(q, onDone) {
+  const reason = el('textarea', { class: 'inp', rows: 2, placeholder: 'Optional: why is this being removed? (kept with the question)' });
+  const stateLabel = (STATE_META[q.state]?.label || q.state);
+  const btn = el('button', { class: 'btn danger', text: 'Remove to graveyard' });
+  const body = el('div', {}, [
+    el('p', { style: 'margin:0 0 6px', text: `Move question #${q.humanId} (${stateLabel}) to the Graveyard? It won’t be deleted — it leaves the ${stateLabel.toLowerCase()} list and can be restored anytime.` }),
+    q.state === 'finalized' ? el('p', { class: 'muted sm', style: 'margin:0 0 10px', text: 'This question is finalized — removing it (admin action) takes it out of the finalized database.' }) : null,
+    reason,
+    el('div', { class: 'row-end gap', style: 'margin-top:14px' }, [
+      el('button', { class: 'btn ghost', text: 'Cancel', onclick: () => m.close() }),
+      btn,
+    ]),
+  ]);
+  btn.addEventListener('click', async () => {
+    btn.disabled = true;
+    try {
+      await S().archiveQuestion(q.id, reason.value.trim());
+      m.close(); toast('Moved to the Graveyard.', 'success'); if (onDone) onDone();
+    } catch (e) { btn.disabled = false; toast(explainError(e), 'error'); }
+  });
+  const m = modal('Remove to graveyard', body);
+}
+
+// ── View: Graveyard ────────────────────────────────────────────────────────────────
+function viewGraveyard() {
+  const host = clear(view());
+  const listHost = el('div', { class: 'qlist' });
+  host.appendChild(el('div', { class: 'page' }, [
+    el('div', { class: 'page-head' }, [
+      el('h1', { text: '🪦 Graveyard' }),
+      el('p', { class: 'muted', text: 'Removed questions — kept out of writing, review, and the finalized database, but never deleted. Restore any of them to return it to where it was.' }),
+    ]),
+    listHost,
+  ]));
+
+  app.unsub = S().watchQuestions({ archived: true }, (rows) => {
+    clear(listHost);
+    if (!rows.length) { listHost.appendChild(emptyState('The Graveyard is empty. Removed questions will show up here.')); return; }
+    for (const q of rows) listHost.appendChild(graveyardCard(q));
+  });
+}
+
+function graveyardCard(q) {
+  const actions = el('div', { class: 'card-actions' });
+  if (canArchive(q)) {
+    actions.appendChild(el('button', {
+      class: 'btn primary sm', text: '↺ Restore', onclick: async () => { await S().restoreQuestion(q.id); toast('Restored.', 'success'); },
+    }));
+  }
+  actions.appendChild(el('button', { class: 'btn ghost sm', text: 'View', onclick: () => modal(`Question #${q.humanId}`, questionDetail(q), { wide: true }) }));
+  if (app.user.role === 'admin') {
+    actions.appendChild(el('button', {
+      class: 'btn danger sm', text: 'Delete forever', onclick: async () => {
+        if (await confirmDialog(`Permanently delete question #${q.humanId}? This cannot be undone.`, { danger: true, confirmText: 'Delete forever' })) { await S().deleteQuestion(q.id); toast('Deleted permanently.'); }
+      },
+    }));
+  }
+
+  const removedBy = q.archivedByName || '—';
+  return el('div', { class: 'qcard archived' }, [
+    el('div', { class: 'qcard-main' }, [
+      el('div', { class: 'qcard-top' }, [
+        el('span', { class: 'qid', text: '#' + q.humanId }),
+        el('span', { class: 'badge st-archived', text: 'Removed' }),
+        stateBadge(q.state),
+        el('span', { class: 'chip', text: `${q.tub} · ${q.type}` }),
+        el('span', { class: 'chip', text: q.subject }),
+        el('span', { class: 'chip subtle', text: q.subcat }),
+        el('span', { class: 'chip subtle', text: 'by ' + (q.writerInitials || q.writerName || '?') }),
+      ]),
+      el('div', { class: 'qcard-text', html: renderMixedToString(q.questionText).slice(0, 600) }),
+      el('div', { class: 'feedback' }, [
+        el('strong', { text: `Removed by ${removedBy}` }),
+        el('span', { text: ` · ${fmtDate(q.archivedAt)}` }),
+        q.archivedReason ? el('span', { text: ' — “' + q.archivedReason + '”' }) : null,
+      ]),
+    ]),
+    actions,
+  ]);
+}
+
 // ── View: My Questions ────────────────────────────────────────────────────────────
 function viewMine() {
   const host = clear(view());
@@ -1033,6 +1132,10 @@ function myCard(q) {
     actions.appendChild(el('button', { class: 'btn primary sm', text: pend > 0 ? 'Edit & resolve suggestions' : 'Edit', onclick: () => openEditor(q) }));
   }
   actions.appendChild(el('button', { class: 'btn ghost sm', text: 'View', onclick: () => openMyQuestion(q) }));
+  // Take an unfinished question out of the pipeline (kept in the Graveyard).
+  if (q.state !== 'finalized' && canArchive(q)) {
+    actions.appendChild(el('button', { class: 'btn ghost sm', text: '🪦 Remove', title: 'Move to the Graveyard (not deleted)', onclick: () => archiveDialog(q) }));
+  }
 
   // "Changes to resolve" banner + the specific reasons.
   const reasons = [];
@@ -1282,6 +1385,10 @@ function openReview(q) {
           toast('Sent back to the writer.', 'success'); m.close();
         },
       }),
+      canArchive(q) ? el('button', {
+        class: 'btn danger', text: '🪦 Remove', title: 'Take this out of the review queue (kept in the Graveyard)',
+        onclick: () => archiveDialog(q, () => m.close()),
+      }) : null,
       canFinalize() ? el('button', {
         class: 'btn primary', text: 'Approve & finalize ★', onclick: async () => {
           if (!(await confirmDialog('Approve this question and move it to the finalized database?', { confirmText: 'Finalize' }))) return;
@@ -1373,6 +1480,7 @@ function renderTable(host, rows) {
       el('td', { class: 'nowrap-sm' }, [
         el('button', { class: 'btn ghost xs', text: 'View', onclick: () => modal(`Question #${q.humanId}`, questionDetail(q), { wide: true }) }),
         app.user.role === 'admin' ? el('button', { class: 'btn ghost xs', text: 'Edit', style: 'margin-left:6px', onclick: () => openAdminEditor(q) }) : null,
+        app.user.role === 'admin' ? el('button', { class: 'btn danger xs', text: 'Remove', style: 'margin-left:6px', title: 'Move to the Graveyard (kept, not deleted)', onclick: () => archiveDialog(q) }) : null,
       ]),
     ]);
   }));
@@ -1416,7 +1524,8 @@ function viewStats() {
   ]));
 
   const draw = () => {
-    const all = app.allQuestions || [];
+    const all = activeQuestions();
+    const removed = (app.allQuestions || []).length - all.length;
     const fin = all.filter((q) => q.state === 'finalized');
     const byState = (st) => all.filter((q) => q.state === st).length;
     const pendingSugs = all.reduce((n, q) => n + (q.suggestions || []).filter((s) => s.status === 'pending').length, 0);
@@ -1437,6 +1546,7 @@ function viewStats() {
       tile('Needing revision', byState('changes_requested')),
       tile('Drafts', byState('draft')),
       tile('Pending suggestions', pendingSugs),
+      removed ? tile('Removed (graveyard)', removed) : null,
     ]));
 
     // ── Per-subject progress (finalized vs total) ──
