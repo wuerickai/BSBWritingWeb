@@ -147,6 +147,13 @@ export async function resetPassword(email) {
 export async function reloadUser() {
   if (auth.currentUser) {
     await auth.currentUser.reload();
+    // Force a fresh ID token. reload() updates the local User object's
+    // emailVerified flag but does NOT mint a new ID token — and Firestore
+    // security rules only ever see the token's email_verified claim. Without
+    // this, a just-verified email/password user keeps sending a token with
+    // email_verified:false, so verified() fails and every question write is
+    // denied for up to an hour (even after an admin approves them as a writer).
+    try { await A.getIdToken(auth.currentUser, true); } catch { /* non-fatal */ }
     const fbUser = auth.currentUser;
     const profile = await ensureProfile(fbUser);
     _user = await userShape(fbUser, profile);
