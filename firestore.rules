@@ -88,7 +88,7 @@ service cloud.firestore {
         // and leave suggested edits, touching only workflow fields.
         (resource.data.writerUid != request.auth.uid
           && request.resource.data.diff(resource.data).affectedKeys()
-               .hasOnly(['state', 'history', 'finalizedAt', 'updatedAt', 'suggestions']))
+               .hasOnly(['state', 'status', 'history', 'finalizedAt', 'updatedAt', 'suggestions']))
         ||
         // Graveyard: any approved user may archive/restore a NON-finalized
         // question (touching only the archive flag + audit fields). Finalized

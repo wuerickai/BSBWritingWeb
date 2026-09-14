@@ -827,7 +827,7 @@ function questionDetail(q) {
 }
 
 function historyTimeline(history) {
-  const labels = { submitted: 'Submitted for review', changes_requested: 'Changes requested', finalized: 'Finalized', comment: 'Comment', suggestion: 'Suggested an edit', suggestion_accepted: 'Suggestion accepted', suggestion_rejected: 'Suggestion rejected', imported: 'Imported from spreadsheet', edited: 'Edited by admin', archived: 'Removed to graveyard', restored: 'Restored from graveyard' };
+  const labels = { submitted: 'Submitted for review', changes_requested: 'Changes requested', approved: 'Reviewed — looks good', finalized: 'Finalized', comment: 'Comment', suggestion: 'Suggested an edit', suggestion_accepted: 'Suggestion accepted', suggestion_rejected: 'Suggestion rejected', imported: 'Imported from spreadsheet', edited: 'Edited by admin', archived: 'Removed to graveyard', restored: 'Restored from graveyard' };
   return el('ul', { class: 'timeline' }, history.slice().reverse().map((h) => el('li', { class: 'tl-item tl-' + h.action }, [
     el('div', { class: 'tl-head' }, [
       el('span', { class: 'tl-action', text: labels[h.action] || h.action }),
@@ -1190,7 +1190,7 @@ function viewReview() {
 
   host.appendChild(el('div', { class: 'page' }, [
     el('div', { class: 'page-head row-between' }, [
-      el('div', {}, [el('h1', { text: 'Review queue' }), el('p', { class: 'muted', text: 'Questions submitted by others. Add suggestions and send back, or approve to finalize.' })]),
+      el('div', {}, [el('h1', { text: 'Review queue' }), el('p', { class: 'muted', text: 'Questions submitted by others. Add suggestions and send back, sign off if it looks good, or approve to finalize.' })]),
       testsolveBtn,
     ]),
     controls, listHost,
@@ -1383,6 +1383,13 @@ function openReview(q) {
           if (!comment.value.trim()) { msg.className = 'form-msg error'; msg.textContent = 'Please add suggestions before sending back.'; return; }
           await S().requestChanges(q.id, comment.value.trim());
           toast('Sent back to the writer.', 'success'); m.close();
+        },
+      }),
+      el('button', {
+        class: 'btn', text: 'Looks good ✓', title: 'Sign off without changes — bumps the review count and keeps it in the queue',
+        onclick: async () => {
+          await S().approveReview(q.id, comment.value.trim());
+          toast('Marked as looking good — review count bumped.', 'success'); m.close();
         },
       }),
       canArchive(q) ? el('button', {

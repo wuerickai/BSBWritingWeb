@@ -273,6 +273,18 @@ export async function requestChanges(id, comment) {
   });
 }
 
+// Reviewer signs off on a question without requesting changes: bumps the review
+// count (status) and keeps it in the queue for the next pass — a lighter-weight
+// alternative to sending it back to the writer.
+export async function approveReview(id, comment) {
+  const u = requireUser();
+  return mutate(id, (q) => {
+    q.status = (q.status || 0) + 1;
+    q.state = 'in_review';
+    q.history.push({ at: now(), byUid: u.uid, byName: u.displayName || u.email, action: 'approved', comment: comment || '', statusAt: q.status });
+  });
+}
+
 export async function finalize(id, comment) {
   const u = requireUser();
   return mutate(id, (q) => {

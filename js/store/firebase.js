@@ -279,6 +279,17 @@ export async function requestChanges(id, comment) {
   await F.updateDoc(F.doc(db, 'questions', id), { state: 'changes_requested', history, updatedAt: now() });
 }
 
+// Reviewer signs off on a question without requesting changes: bumps the review
+// count (status) and keeps it in the queue for the next pass — a lighter-weight
+// alternative to sending it back to the writer.
+export async function approveReview(id, comment) {
+  const u = requireUser();
+  const q = await getQ(id);
+  const status = (q.status || 0) + 1;
+  const history = (q.history || []).concat({ at: now(), byUid: u.uid, byName: u.displayName || u.email, action: 'approved', comment: comment || '', statusAt: status });
+  await F.updateDoc(F.doc(db, 'questions', id), { status, state: 'in_review', history, updatedAt: now() });
+}
+
 export async function finalize(id, comment) {
   const u = requireUser();
   const q = await getQ(id);
