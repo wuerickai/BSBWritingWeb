@@ -1000,11 +1000,11 @@ function openMyQuestion(qInit) {
 
 // ── Graveyard (soft-remove) ───────────────────────────────────────────────────
 // Who may archive / restore a question: finalized ones are admin-only; anything
-// still in the writing/review pipeline can be removed by its author or by a
-// reviewer/admin. Restore uses the question's preserved original state.
+// still in the writing/review pipeline can be removed by any approved user
+// (writers included). Restore uses the question's preserved original state.
 function canArchive(q) {
   if (q.state === 'finalized') return app.user.role === 'admin';
-  return q.writerUid === app.user.uid || ['reviewer', 'admin'].includes(app.user.role);
+  return isApprovedRole(app.user.role);
 }
 
 // A small modal that captures an optional reason, then archives the question.
