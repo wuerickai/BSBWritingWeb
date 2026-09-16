@@ -1667,6 +1667,29 @@ function viewStats() {
       barChart('Suggestions by outcome', sugEntries, 'suggestions'),
     ]));
 
+    // ── Distribution of approvals per question ──
+    // Accepted suggested edits + "looks good" sign-offs a question has picked up.
+    const approvalsFor = (q) =>
+      (q.suggestions || []).filter((s) => s.status === 'accepted').length +
+      (q.history || []).filter((h) => h.action === 'approved').length;
+    const approvalDist = new Map();   // count → number of questions
+    for (const q of submitted) { const n = approvalsFor(q); approvalDist.set(n, (approvalDist.get(n) || 0) + 1); }
+    const maxApprovals = Math.max(0, ...approvalDist.keys());
+    const CAP = 5;                    // bucket everything above this as "N+"
+    const approvalBuckets = new Map();
+    for (const [n, qty] of approvalDist) {
+      const k = n >= CAP && maxApprovals > CAP ? CAP : n;
+      approvalBuckets.set(k, (approvalBuckets.get(k) || 0) + qty);
+    }
+    const approvalEntries = [...approvalBuckets.entries()]
+      .sort((a, b) => a[0] - b[0])
+      .map(([k, qty]) => {
+        const capped = k === CAP && maxApprovals > CAP;
+        const label = (capped ? `${k}+` : String(k)) + ' approval' + (k === 1 && !capped ? '' : 's');
+        return [k === 0 ? 'None yet' : label, qty];
+      });
+    content.appendChild(barChart('Questions by approvals (accepted edits + sign-offs)', approvalEntries, 'reviewed questions'));
+
     content.appendChild(el('div', { class: 'card stat-card' }, [
       el('h3', { text: 'Reviewer activity' }),
       reviewerRows.length
