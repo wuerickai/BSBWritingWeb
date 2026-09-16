@@ -1927,18 +1927,51 @@ function viewCompile() {
     compRow.appendChild(el('label', { class: 'compile-comp-item' }, [el('span', { class: 'sm', text: c.subject }), inp]));
   }
 
+  // Drag a filled Toss-up/Bonus onto another slot of the SAME subject to re-pair:
+  // an empty target moves the question; an occupied target swaps the two.
+  const findSlot = (key) => slots.find((s) => s.key === key);
+  let dragSrc = null; // { key, role, subject }
+  const applyMove = (srcKey, srcRole, dstKey, dstRole) => {
+    if (srcKey === dstKey && srcRole === dstRole) return;
+    const src = findSlot(srcKey); const dst = findSlot(dstKey);
+    if (!src || !dst || !src[srcRole]) return;
+    if (src.subject !== dst.subject) { toast('You can only re-pair within the same subject.', 'warn'); return; }
+    const moving = src[srcRole];
+    src[srcRole] = dst[dstRole] || null; // swap back whatever was there (or clear)
+    dst[dstRole] = moving;
+    redraw();
+  };
+
   const slotTarget = (slot, role) => {
     const q = slot[role];
     const roleLabel = role === 'tu' ? 'Toss-up' : 'Bonus';
+    const node = el('div', { class: 'compile-target ' + (q ? 'filled' : 'empty') });
+    // Every target accepts a drop from the same subject.
+    node.addEventListener('dragover', (e) => {
+      if (!dragSrc || dragSrc.subject !== slot.subject) return;
+      e.preventDefault(); e.dataTransfer.dropEffect = 'move'; node.classList.add('drag-over');
+    });
+    node.addEventListener('dragleave', () => node.classList.remove('drag-over'));
+    node.addEventListener('drop', (e) => {
+      e.preventDefault(); node.classList.remove('drag-over');
+      if (!dragSrc) return;
+      applyMove(dragSrc.key, dragSrc.role, slot.key, role);
+    });
     if (!q) {
-      return el('div', { class: 'compile-target empty' }, [
+      node.append(
         el('span', { class: 'compile-target-role', text: roleLabel }),
         el('span', { class: 'muted sm', text: 'empty' }),
-      ]);
+      );
+      return node;
     }
     const mismatch = (role === 'tu' && q.tub !== 'TU') || (role === 'b' && q.tub !== 'B');
-    return el('div', { class: 'compile-target filled' }, [
+    node.setAttribute('draggable', 'true');
+    node.title = 'Drag to re-pair (same subject)';
+    node.addEventListener('dragstart', (e) => { dragSrc = { key: slot.key, role, subject: slot.subject }; node.classList.add('dragging'); e.dataTransfer.effectAllowed = 'move'; try { e.dataTransfer.setData('text/plain', slot.key + '|' + role); } catch {} });
+    node.addEventListener('dragend', () => { dragSrc = null; node.classList.remove('dragging'); roundHost.querySelectorAll('.drag-over').forEach((n) => n.classList.remove('drag-over')); });
+    node.append(
       el('div', { class: 'compile-target-head' }, [
+        el('span', { class: 'drag-grip', text: '⠿', title: 'Drag to re-pair' }),
         el('span', { class: 'compile-target-role', text: roleLabel }),
         el('span', { class: 'chip subtle', text: '#' + q.humanId }),
         q.difficulty ? el('span', { class: 'chip subtle', text: 'D' + q.difficulty }) : null,
@@ -1949,7 +1982,8 @@ function viewCompile() {
         ]),
       ]),
       el('div', { class: 'compile-qtext', text: snippet(q.questionText, 90) }),
-    ]);
+    );
+    return node;
   };
 
   const drawRound = () => {
@@ -1973,8 +2007,12 @@ function viewCompile() {
       ]);
       const groupEl = el('div', { class: 'compile-group' }, [head]);
       g.slots.forEach((slot, i) => {
+        const nCell = el('div', { class: 'compile-pair-n' }, [
+          el('span', { text: '#' + (i + 1) }),
+          (slot.tu || slot.b) ? el('button', { class: 'icon-btn sm', text: '⇄', title: 'Swap this pair’s Toss-up and Bonus', onclick: () => { const t = slot.tu; slot.tu = slot.b; slot.b = t; redraw(); } }) : null,
+        ]);
         groupEl.appendChild(el('div', { class: 'compile-pair' }, [
-          el('span', { class: 'compile-pair-n', text: '#' + (i + 1) }),
+          nCell,
           slotTarget(slot, 'tu'),
           slotTarget(slot, 'b'),
         ]));
