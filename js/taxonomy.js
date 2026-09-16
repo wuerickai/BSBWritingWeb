@@ -99,6 +99,18 @@ export const DIFFICULTIES = [
 
 export const MC_SLOTS = ['W', 'X', 'Y', 'Z'];
 
+// Default composition of a compiled round: how many Toss-up / Bonus PAIRS come
+// from each subject. Four of every main category plus three Energy = 23 pairs,
+// matching the BSBcompile `round_composition = [4, 4, 4, 4, 4, 3]`.
+export const ROUND_COMPOSITION = [
+  { subject: 'Biology', pairs: 4 },
+  { subject: 'Chemistry', pairs: 4 },
+  { subject: 'Earth and Space', pairs: 4 },
+  { subject: 'Math', pairs: 4 },
+  { subject: 'Physics', pairs: 4 },
+  { subject: 'Energy', pairs: 3 },
+];
+
 export function subcatsFor(subject) {
   return SUBCATEGORIES[subject] || [];
 }

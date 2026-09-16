@@ -6,7 +6,7 @@
 import { CONFIG } from './config.js';
 import { initStore, S, backendKind } from './store/index.js';
 import * as T from './taxonomy.js';
-import { validateLatex, validateQuestion, renderInto, renderMixedToString, allCapsPreservingLatex } from './latex.js';
+import { validateLatex, validateQuestion, renderInto, renderMixedToString, allCapsPreservingLatex, escapeHtml } from './latex.js';
 import { findDuplicates, diffToHtml, hasChanges, checkFormat, mergeEdit } from './text.js';
 import { csvToQuestions } from './csv.js';
 import * as Backup from './backup.js';
@@ -16,7 +16,7 @@ import {
 
 const app = { user: null, unsub: null, allQuestions: [], allUnsub: null };
 const view = () => document.getElementById('view');
-const ROUTES = ['write', 'mine', 'review', 'finalized', 'stats', 'graveyard', 'admin'];
+const ROUTES = ['write', 'mine', 'review', 'finalized', 'stats', 'graveyard', 'compile', 'admin'];
 
 // Questions that still count as "live" — everything not moved to the Graveyard.
 // The global feed keeps archived questions (so they stay backed up); dedupe and
@@ -152,7 +152,7 @@ function renderHeader() {
       ['stats', '𝛴 Statistics'],
       ['graveyard', '🪦 Graveyard'],
     ];
-    if (app.user.role === 'admin') tabs.push(['admin', '⚙ Admin']);
+    if (app.user.role === 'admin') tabs.push(['compile', '📄 Compile'], ['admin', '⚙ Admin']);
     const nav = el('nav', { class: 'tabs' });
     const cur = currentRoute();
     let adminAnchor = null;
@@ -359,6 +359,7 @@ function routeTo(route) {
     case 'finalized': return viewFinalized();
     case 'stats': return viewStats();
     case 'graveyard': return viewGraveyard();
+    case 'compile': return app.user.role === 'admin' ? viewCompile() : viewWrite();
     case 'admin': return app.user.role === 'admin' ? viewAdmin() : viewWrite();
     default: return viewWrite();
   }
@@ -1711,6 +1712,436 @@ function viewStats() {
   const onData = () => { if (currentRoute() === 'stats') draw(); };
   document.addEventListener('sbq-allquestions', onData);
   app.unsub = () => document.removeEventListener('sbq-allquestions', onData);
+}
+
+// ── Round compilation → LaTeX ─────────────────────────────────────────────────────
+// Mirrors the BSBcompile `question_to_TeX.py` output so compiled rounds line up
+// with the format writers/editors already use.
+function questionToTex(q) {
+  let tex = (q.subject || '') + '\\;\\;--\\;\\;';
+  tex += q.type === 'SA' ? '\\emph{Short Answer}\\quad ' : '\\emph{Multiple Choice}\\quad ';
+  tex += (q.questionText || '').trim();
+  if (q.type === 'SA') {
+    tex += '\\\\ \\newline ANSWER: ' + allCapsPreservingLatex((q.answerLine || '').trim());
+  } else {
+    const ch = q.choices || {};
+    tex += '\\newline \\\\ W) ' + (ch.W ?? '');
+    tex += '\\\\ X) ' + (ch.X ?? '');
+    tex += '\\\\ Y) ' + (ch.Y ?? '');
+    tex += '\\\\ Z) ' + (ch.Z ?? '');
+    const letter = q.mcAnswer || '';
+    const answerText = q.mcAnswerText || allCapsPreservingLatex(ch[letter] || '');
+    tex += '\\\\ \\newline ANSWER: ' + letter + ') ' + answerText;
+  }
+  return tex;
+}
+
+// A standalone, compilable document. Defines the custom \pron{} macro the writers
+// use (mhchem supplies \ce{} and \pu{}).
+const ROUND_TEX_PREAMBLE = [
+  '\\documentclass[11pt]{article}',
+  '\\usepackage[margin=1in]{geometry}',
+  '\\usepackage{amsmath,amssymb}',
+  '\\usepackage[version=4]{mhchem}',
+  '\\newcommand{\\pron}[1]{[\\textbf{\\textit{#1}}]}',
+].join('\n');
+
+function buildRoundTex(pairs, { title = 'Round', fullDocument = true } = {}) {
+  const lines = [];
+  let n = 1;
+  for (const pair of pairs) {
+    lines.push('\\begin{center} \\textbf{TOSS-UP} \\end{center}', '');
+    lines.push(`${n}) ${questionToTex(pair.tu)}`, '');
+    lines.push('\\begin{center} \\textbf{BONUS} \\end{center}', '');
+    lines.push(`${n}) ${questionToTex(pair.b)}`, '');
+    lines.push(n % 2 === 0 ? '\\pagebreak' : '\\hrulefill', '');
+    n++;
+  }
+  const body = lines.join('\n');
+  if (!fullDocument) return body;
+  const safeTitle = String(title || 'Round').replace(/([#$%&_{}])/g, '\\$1');
+  return [
+    ROUND_TEX_PREAMBLE,
+    `\\title{${safeTitle}}`,
+    '\\date{}',
+    '\\begin{document}',
+    '\\maketitle',
+    '',
+    body,
+    '\\end{document}',
+    '',
+  ].join('\n');
+}
+
+// BSBcompile ordering: group complete pairs by subject, shuffle within each
+// subject, then round-robin across subjects so categories interleave.
+function interleaveShuffle(pairs) {
+  const byCat = new Map();
+  for (const p of pairs) {
+    if (!byCat.has(p.subject)) byCat.set(p.subject, []);
+    byCat.get(p.subject).push(p);
+  }
+  for (const list of byCat.values()) list.sort(() => Math.random() - 0.5);
+  const cats = [...byCat.keys()];
+  const out = [];
+  while (cats.some((c) => byCat.get(c).length)) {
+    cats.sort(() => Math.random() - 0.5);
+    for (const c of cats) { const list = byCat.get(c); if (list.length) out.push(list.shift()); }
+  }
+  return out;
+}
+
+// ── View: Compile a round ─────────────────────────────────────────────────────────
+// Admin-only. Pick finalized questions into a 23-pair round (4 per main subject +
+// 3 Energy) as Toss-ups / Bonuses, live-edit any finalized question, preview the
+// rendered round, then export LaTeX in the BSBcompile format. The three panels
+// (Pool · Builder · Preview) can be resized by dragging the gutters or hidden.
+function viewCompile() {
+  const host = clear(view());
+
+  // Round state: a flat list of pair slots, each bound to a subject.
+  let composition = T.ROUND_COMPOSITION.map((c) => ({ ...c }));
+  let slots = [];       // { key, subject, tu: q|null, b: q|null }
+  let seq = 0;
+  let all = [];         // finalized questions
+
+  const buildSlots = (preserve = true) => {
+    const old = slots;
+    slots = [];
+    for (const { subject, pairs } of composition) {
+      const prior = preserve ? old.filter((s) => s.subject === subject) : [];
+      for (let i = 0; i < pairs; i++) {
+        const p = prior[i];
+        slots.push({ key: 'slot-' + (seq++), subject, tu: p ? p.tu : null, b: p ? p.b : null });
+      }
+    }
+  };
+  buildSlots(false);
+
+  const usedIds = () => new Set(slots.flatMap((s) => [s.tu?.id, s.b?.id].filter(Boolean)));
+
+  const snippet = (t, len = 120) => {
+    const s = (t || '').replace(/\$[^$]*\$/g, '∎').replace(/\\[a-zA-Z]+\{([^}]*)\}/g, '$1');
+    return s.length > len ? s.slice(0, len) + '…' : s;
+  };
+
+  // ── Pool (left) ──
+  const filters = { subject: '', subcat: '', tub: '', difficulty: '', q: '' };
+  const subjectSel = el('select', { class: 'inp sm' });
+  fillSelect(subjectSel, T.SUBJECTS, { placeholder: 'All subjects' });
+  const subcatSel = el('select', { class: 'inp sm' });
+  fillSelect(subcatSel, [], { placeholder: 'All subcategories' });
+  const tubSel = el('select', { class: 'inp sm' });
+  fillSelect(tubSel, T.TUB, { value: (x) => x.value, label: (x) => x.label, placeholder: 'TU & B' });
+  const diffSel = el('select', { class: 'inp sm' });
+  fillSelect(diffSel, T.DIFFICULTIES, { value: (x) => x.value, label: (x) => x.label, placeholder: 'All difficulties' });
+  const search = el('input', { class: 'inp sm grow', placeholder: 'Search question text…' });
+  subjectSel.addEventListener('change', () => {
+    filters.subject = subjectSel.value; filters.subcat = '';
+    fillSelect(subcatSel, T.subcatsFor(subjectSel.value), { placeholder: 'All subcategories' });
+    drawPool();
+  });
+  const bindF = (node, key, ev = 'change') => node.addEventListener(ev, () => { filters[key] = node.value; drawPool(); });
+  bindF(subcatSel, 'subcat'); bindF(tubSel, 'tub'); bindF(diffSel, 'difficulty'); bindF(search, 'q', 'input');
+
+  const poolCount = el('span', { class: 'muted sm' });
+  const poolList = el('div', { class: 'compile-pool' });
+
+  // Assign a question to the first open slot of `role` whose subject matches.
+  const assign = (q, role) => {
+    if (usedIds().has(q.id)) { toast('That question is already in the round.', 'warn'); return; }
+    const slot = slots.find((s) => s.subject === q.subject && s[role] == null);
+    if (!slot) { toast(`No open ${role === 'tu' ? 'Toss-up' : 'Bonus'} slot for ${q.subject}.`, 'warn'); return; }
+    slot[role] = q;
+    redraw();
+  };
+
+  const drawPool = () => {
+    const used = usedIds();
+    const rows = all.filter((q) => (!filters.subject || q.subject === filters.subject)
+      && (!filters.subcat || q.subcat === filters.subcat)
+      && (!filters.tub || q.tub === filters.tub)
+      && (!filters.difficulty || String(q.difficulty) === filters.difficulty)
+      && (!filters.q || (q.questionText || '').toLowerCase().includes(filters.q.toLowerCase()) || (q.answerLine || '').toLowerCase().includes(filters.q.toLowerCase())));
+    poolCount.textContent = `${rows.length} finalized`;
+    clear(poolList);
+    if (!rows.length) { poolList.appendChild(el('p', { class: 'muted sm', style: 'padding:8px', text: 'No finalized questions match these filters.' })); return; }
+    for (const q of rows) {
+      const inRound = used.has(q.id);
+      poolList.appendChild(el('div', { class: 'compile-poolrow' + (inRound ? ' is-used' : '') }, [
+        el('div', { class: 'compile-poolrow-main' }, [
+          el('div', { class: 'compile-chips' }, [
+            el('span', { class: 'chip subtle', text: '#' + q.humanId }),
+            el('span', { class: 'chip subtle', text: q.subject }),
+            q.subcat ? el('span', { class: 'chip subtle', text: q.subcat }) : null,
+            el('span', { class: 'chip subtle', text: q.tub }),
+            el('span', { class: 'chip subtle', text: q.type }),
+            q.difficulty ? el('span', { class: 'chip subtle', text: 'D' + q.difficulty }) : null,
+          ]),
+          el('div', { class: 'compile-qtext', text: snippet(q.questionText) }),
+        ]),
+        el('div', { class: 'compile-poolrow-actions' }, inRound
+          ? [el('span', { class: 'chip', text: '✓ in round' })]
+          : [
+              el('button', { class: 'btn ghost xs', text: 'View', onclick: () => modal(`Question #${q.humanId}`, questionDetail(q), { wide: true }) }),
+              el('button', { class: 'btn ghost xs', text: '✎', title: 'Edit #' + q.humanId, onclick: () => openAdminEditor(q) }),
+              el('button', { class: 'btn ghost xs', text: '→ TU', title: 'Add as the next open Toss-up for ' + q.subject, onclick: () => assign(q, 'tu') }),
+              el('button', { class: 'btn ghost xs', text: '→ B', title: 'Add as the next open Bonus for ' + q.subject, onclick: () => assign(q, 'b') }),
+            ]),
+      ]));
+    }
+  };
+
+  // ── Builder (middle) ──
+  const roundHost = el('div', { class: 'compile-round' });
+  const roundSummary = el('span', { class: 'muted sm' });
+  const compTotal = el('span', { class: 'muted sm' });
+  const compRow = el('div', { class: 'compile-comp' });
+  for (const c of composition) {
+    const inp = el('input', { type: 'number', min: '0', max: '20', value: String(c.pairs), class: 'inp sm', style: 'width:58px' });
+    inp.addEventListener('change', () => { c.pairs = Math.max(0, parseInt(inp.value, 10) || 0); inp.value = String(c.pairs); applyComposition(); });
+    compRow.appendChild(el('label', { class: 'compile-comp-item' }, [el('span', { class: 'sm', text: c.subject }), inp]));
+  }
+
+  const slotTarget = (slot, role) => {
+    const q = slot[role];
+    const roleLabel = role === 'tu' ? 'Toss-up' : 'Bonus';
+    if (!q) {
+      return el('div', { class: 'compile-target empty' }, [
+        el('span', { class: 'compile-target-role', text: roleLabel }),
+        el('span', { class: 'muted sm', text: 'empty' }),
+      ]);
+    }
+    const mismatch = (role === 'tu' && q.tub !== 'TU') || (role === 'b' && q.tub !== 'B');
+    return el('div', { class: 'compile-target filled' }, [
+      el('div', { class: 'compile-target-head' }, [
+        el('span', { class: 'compile-target-role', text: roleLabel }),
+        el('span', { class: 'chip subtle', text: '#' + q.humanId }),
+        q.difficulty ? el('span', { class: 'chip subtle', text: 'D' + q.difficulty }) : null,
+        mismatch ? el('span', { class: 'chip warn', title: `Written as ${q.tub}`, text: 'written ' + q.tub }) : null,
+        el('span', { style: 'margin-left:auto; display:flex; gap:2px' }, [
+          el('button', { class: 'icon-btn sm', text: '✎', title: 'Edit #' + q.humanId, onclick: () => openAdminEditor(q) }),
+          el('button', { class: 'icon-btn sm', text: '✕', title: 'Remove', onclick: () => { slot[role] = null; redraw(); } }),
+        ]),
+      ]),
+      el('div', { class: 'compile-qtext', text: snippet(q.questionText, 90) }),
+    ]);
+  };
+
+  const drawRound = () => {
+    clear(roundHost);
+    let filled = 0; const total = slots.length * 2;
+    let curSubject = null; let group = null; let idx = 0;
+    for (const slot of slots) {
+      if (slot.subject !== curSubject) {
+        curSubject = slot.subject;
+        const n = composition.find((c) => c.subject === curSubject)?.pairs || 0;
+        group = el('div', { class: 'compile-group' }, [el('h4', { class: 'compile-group-h', text: `${curSubject} · ${n} pair${n === 1 ? '' : 's'}` })]);
+        roundHost.appendChild(group);
+        idx = 0;
+      }
+      idx++;
+      if (slot.tu) filled++; if (slot.b) filled++;
+      group.appendChild(el('div', { class: 'compile-pair' }, [
+        el('span', { class: 'compile-pair-n', text: '#' + idx }),
+        slotTarget(slot, 'tu'),
+        slotTarget(slot, 'b'),
+      ]));
+    }
+    roundSummary.textContent = `${filled} / ${total} filled · ${slots.length} pairs`;
+  };
+
+  const applyComposition = () => {
+    const total = composition.reduce((n, c) => n + c.pairs, 0);
+    compTotal.textContent = `${total} pairs · ${total * 2} questions`;
+    buildSlots(true);
+    redraw();
+  };
+
+  // ── Preview (right) — rendered round in export order (build order) ──
+  const previewHost = el('div', { class: 'compile-preview' });
+
+  const previewQ = (n, q) => {
+    if (!q) return el('div', { class: 'pv-q muted', text: `${n}) (empty)` });
+    const head = el('div', { class: 'pv-qhead' }, [
+      el('span', { class: 'pv-num', text: n + ')' }),
+      el('span', { class: 'pv-subj', html: `${escapeHtml(q.subject)} — <em>${q.type === 'SA' ? 'Short Answer' : 'Multiple Choice'}</em>` }),
+      el('button', { class: 'icon-btn sm', text: '✎', title: 'Edit #' + q.humanId, style: 'margin-left:auto', onclick: () => openAdminEditor(q) }),
+    ]);
+    const body = el('div', { class: 'render-block pv-body', html: renderMixedToString(q.questionText) });
+    const kids = [head, body];
+    if (q.type === 'MC') {
+      kids.push(el('div', { class: 'pv-choices' }, T.MC_SLOTS.map((s) => el('div', {
+        class: 'pv-choice' + (q.mcAnswer === s ? ' correct' : ''),
+      }, [el('span', { class: 'pv-choice-key', text: s + ')' }), el('span', { html: renderMixedToString(q.choices?.[s] || '') })]))));
+      const caps = q.mcAnswerText || allCapsPreservingLatex(q.choices?.[q.mcAnswer] || '');
+      kids.push(el('div', { class: 'pv-answer' }, [el('strong', { text: 'ANSWER: ' + (q.mcAnswer || '') + ') ' }), el('span', { html: renderMixedToString(caps) })]));
+    } else {
+      kids.push(el('div', { class: 'pv-answer' }, [el('strong', { text: 'ANSWER: ' }), el('span', { html: renderMixedToString(allCapsPreservingLatex(q.answerLine || '')) })]));
+    }
+    return el('div', { class: 'pv-q' }, kids);
+  };
+
+  const drawPreview = () => {
+    clear(previewHost);
+    let n = 0; let incomplete = 0;
+    for (const slot of slots) {
+      if (slot.tu && slot.b) {
+        n++;
+        previewHost.appendChild(el('div', { class: 'pv-pair' }, [
+          el('div', { class: 'pv-tag', text: 'TOSS-UP' }), previewQ(n, slot.tu),
+          el('div', { class: 'pv-tag', text: 'BONUS' }), previewQ(n, slot.b),
+          el('hr', { class: 'pv-rule' }),
+        ]));
+      } else if (slot.tu || slot.b) {
+        incomplete++;
+        previewHost.appendChild(el('div', { class: 'pv-pair pv-incomplete' }, [
+          el('div', { class: 'muted sm', text: `Incomplete ${slot.subject} pair — fill both a Toss-up and a Bonus` }),
+        ]));
+      }
+    }
+    if (!n && !incomplete) previewHost.appendChild(emptyState('Assign questions on the left to preview the round here.'));
+    else if (!n) previewHost.appendChild(el('p', { class: 'muted sm', text: 'No complete pairs yet.' }));
+  };
+
+  const redraw = () => { drawPool(); drawRound(); drawPreview(); };
+
+  // ── Export controls (live in the preview panel) ──
+  const titleInp = el('input', { class: 'inp sm', value: 'Round', placeholder: 'Round title' });
+  const shuffleChk = el('input', { type: 'checkbox', checked: true });
+  const fullDocChk = el('input', { type: 'checkbox', checked: true });
+
+  const compile = async () => {
+    const complete = slots.filter((s) => s.tu && s.b);
+    const missing = slots.length - complete.length;
+    if (!complete.length) { toast('Fill at least one full Toss-up + Bonus pair first.', 'warn'); return; }
+    if (missing > 0) {
+      const ok = await confirmDialog(`${missing} pair${missing === 1 ? ' is' : 's are'} incomplete and will be skipped. Compile the ${complete.length} complete pair${complete.length === 1 ? '' : 's'}?`, { confirmText: 'Compile' });
+      if (!ok) return;
+    }
+    const ordered = shuffleChk.checked ? interleaveShuffle(complete) : complete;
+    const tex = buildRoundTex(ordered, { title: titleInp.value.trim() || 'Round', fullDocument: fullDocChk.checked });
+    showTexModal(tex, titleInp.value.trim() || 'Round');
+  };
+  const compileBtn = el('button', { class: 'btn primary sm', text: '📄 Compile LaTeX', onclick: compile });
+  const resetBtn = el('button', { class: 'btn ghost sm', text: 'Clear', onclick: async () => {
+    if (slots.some((s) => s.tu || s.b) && !(await confirmDialog('Clear all assigned questions from this round?', { danger: true, confirmText: 'Clear' }))) return;
+    buildSlots(false); redraw();
+  } });
+
+  // ── Three-panel layout with draggable gutters + show/hide ──
+  const PANEL_META = { pool: 'Pool', builder: 'Builder', preview: 'Preview' };
+  const saved = (() => { try { return JSON.parse(localStorage.getItem('sbq-compile-layout') || '{}'); } catch { return {}; } })();
+  const panels = [
+    { key: 'pool', grow: saved.pool?.grow ?? 1, hidden: saved.pool?.hidden ?? false, node: el('section', { class: 'compile-panel' }, [
+      el('div', { class: 'compile-col-head' }, [el('h3', { text: 'Finalized pool' }), poolCount]),
+      el('div', { class: 'filters wrap' }, [subjectSel, subcatSel, tubSel, diffSel, search]),
+      poolList,
+    ]) },
+    { key: 'builder', grow: saved.builder?.grow ?? 1.25, hidden: saved.builder?.hidden ?? false, node: el('section', { class: 'compile-panel' }, [
+      el('div', { class: 'compile-col-head' }, [el('h3', { text: 'Round' }), roundSummary]),
+      el('div', { class: 'compile-comp-bar' }, [compRow, el('div', { class: 'spacer' }), compTotal, resetBtn]),
+      roundHost,
+    ]) },
+    { key: 'preview', grow: saved.preview?.grow ?? 1.1, hidden: saved.preview?.hidden ?? false, node: el('section', { class: 'compile-panel' }, [
+      el('div', { class: 'compile-col-head' }, [el('h3', { text: 'Preview' }), compileBtn]),
+      el('div', { class: 'compile-options' }, [
+        field('Title', titleInp),
+        el('label', { class: 'compile-check' }, [shuffleChk, el('span', { class: 'sm', text: 'Shuffle on export' })]),
+        el('label', { class: 'compile-check' }, [fullDocChk, el('span', { class: 'sm', text: 'Full document' })]),
+      ]),
+      previewHost,
+    ]) },
+  ];
+  const persist = () => { try { localStorage.setItem('sbq-compile-layout', JSON.stringify(Object.fromEntries(panels.map((p) => [p.key, { grow: p.grow, hidden: p.hidden }])))); } catch {} };
+
+  const splitHost = el('div', { class: 'compile-split' });
+  const layout = () => {
+    clear(splitHost);
+    const vis = panels.filter((p) => !p.hidden);
+    vis.forEach((p, i) => {
+      p.node.style.flex = `${p.grow} 1 0`;
+      splitHost.appendChild(p.node);
+      if (i < vis.length - 1) splitHost.appendChild(makeGutter(p, vis[i + 1]));
+    });
+  };
+  function makeGutter(left, right) {
+    const g = el('div', { class: 'compile-gutter', title: 'Drag to resize' });
+    g.addEventListener('pointerdown', (e) => {
+      e.preventDefault();
+      const rect = splitHost.getBoundingClientRect();
+      const startX = e.clientX;
+      const total = left.grow + right.grow;
+      const lStart = left.grow;
+      const sumGrow = panels.filter((p) => !p.hidden).reduce((s, p) => s + p.grow, 0);
+      g.setPointerCapture(e.pointerId);
+      const move = (ev) => {
+        const deltaGrow = ((ev.clientX - startX) / rect.width) * sumGrow;
+        const l = Math.max(0.25, Math.min(total - 0.25, lStart + deltaGrow));
+        left.grow = l; right.grow = total - l;
+        left.node.style.flexGrow = String(l); right.node.style.flexGrow = String(total - l);
+      };
+      const up = () => { g.removeEventListener('pointermove', move); g.removeEventListener('pointerup', up); persist(); };
+      g.addEventListener('pointermove', move);
+      g.addEventListener('pointerup', up);
+    });
+    return g;
+  }
+
+  const toggleBar = el('div', { class: 'compile-toggles' }, [el('span', { class: 'filter-label', text: 'Panels:' })]);
+  for (const p of panels) {
+    const btn = el('button', { class: 'btn ghost sm' + (p.hidden ? '' : ' active'), text: PANEL_META[p.key] });
+    btn.addEventListener('click', () => {
+      if (!p.hidden && panels.filter((x) => !x.hidden).length === 1) { toast('At least one panel must stay open.', 'warn'); return; }
+      p.hidden = !p.hidden;
+      btn.classList.toggle('active', !p.hidden);
+      layout(); persist();
+    });
+    toggleBar.appendChild(btn);
+  }
+
+  host.appendChild(el('div', { class: 'page compile-page' }, [
+    el('div', { class: 'page-head' }, [
+      el('h1', { text: 'Compile a round' }),
+      el('p', { class: 'muted', text: 'Assign finalized questions into Toss-up / Bonus pairs, edit them live, preview the round, then export LaTeX. Drag the gutters to resize; use Panels to hide sections.' }),
+    ]),
+    toggleBar,
+    splitHost,
+  ]));
+
+  layout();
+  applyComposition();
+  // Live: re-sync slot references by id so admin edits (and any (un)finalizing)
+  // reflect immediately in the builder and preview.
+  app.unsub = S().watchQuestions({ finalized: true }, (rows) => {
+    all = rows;
+    const byId = new Map(rows.map((r) => [r.id, r]));
+    for (const s of slots) {
+      if (s.tu) s.tu = byId.get(s.tu.id) || null;
+      if (s.b) s.b = byId.get(s.b.id) || null;
+    }
+    redraw();
+  });
+}
+
+function showTexModal(tex, title) {
+  const ta = el('textarea', { class: 'inp', style: 'width:100%;min-height:340px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.82rem;white-space:pre' });
+  ta.value = tex;
+  const body = el('div', {}, [
+    el('p', { class: 'muted sm', style: 'margin:0 0 10px', text: 'Copy the LaTeX below or download it as a .tex file.' }),
+    ta,
+    el('div', { class: 'row-end gap', style: 'margin-top:14px' }, [
+      el('button', { class: 'btn ghost', text: 'Copy', onclick: async () => {
+        try { await navigator.clipboard.writeText(tex); toast('Copied LaTeX to clipboard.', 'success'); }
+        catch { ta.select(); document.execCommand('copy'); toast('Copied.', 'success'); }
+      } }),
+      el('button', { class: 'btn primary', text: '⬇ Download .tex', onclick: () => {
+        const name = (title || 'round').replace(/[^a-z0-9._-]+/gi, '_') + '.tex';
+        triggerDownload(new Blob([tex], { type: 'application/x-tex' }), name);
+      } }),
+    ]),
+  ]);
+  modal('Compiled round — LaTeX', body, { wide: true });
 }
 
 // ── View: Admin (sub-tabs: Users / Import / Backups) ─────────────────────────────
