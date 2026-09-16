@@ -1800,10 +1800,23 @@ function viewCompile() {
   const host = clear(view());
 
   // Round state: a flat list of pair slots, each bound to a subject.
+  // Progress (composition + which question sits in each slot) autosaves to
+  // localStorage and is restored — by question id — when the pool loads.
+  const PROGRESS_KEY = 'sbq-compile-progress';
+  const savedProgress = (() => { try { return JSON.parse(localStorage.getItem(PROGRESS_KEY) || 'null'); } catch { return null; } })();
+
   let composition = T.ROUND_COMPOSITION.map((c) => ({ ...c }));
+  if (savedProgress?.composition) {
+    for (const c of composition) {
+      const m = savedProgress.composition.find((x) => x.subject === c.subject);
+      if (m && Number.isFinite(m.pairs)) c.pairs = m.pairs;
+    }
+  }
   let slots = [];       // { key, subject, tu: q|null, b: q|null }
   let seq = 0;
   let all = [];         // finalized questions
+  // Slot→id assignments awaiting hydration from the first finalized-question load.
+  let pendingHydrate = Array.isArray(savedProgress?.slots) ? savedProgress.slots : null;
 
   const buildSlots = (preserve = true) => {
     const old = slots;
@@ -1817,6 +1830,16 @@ function viewCompile() {
     }
   };
   buildSlots(false);
+
+  const saveProgress = () => {
+    if (pendingHydrate) return; // don't overwrite saved assignments before they're restored
+    try {
+      localStorage.setItem(PROGRESS_KEY, JSON.stringify({
+        composition: composition.map((c) => ({ subject: c.subject, pairs: c.pairs })),
+        slots: slots.map((s) => ({ subject: s.subject, tu: s.tu?.id || null, b: s.b?.id || null })),
+      }));
+    } catch {}
+  };
 
   const usedIds = () => new Set(slots.flatMap((s) => [s.tu?.id, s.b?.id].filter(Boolean)));
 
@@ -1840,6 +1863,7 @@ function viewCompile() {
     filters.subject = subjectSel.value; filters.subcat = '';
     fillSelect(subcatSel, T.subcatsFor(subjectSel.value), { placeholder: 'All subcategories' });
     drawPool();
+    drawRound(); // surface the filtered subject at the top of the builder
   });
   const bindF = (node, key, ev = 'change') => node.addEventListener(ev, () => { filters[key] = node.value; drawPool(); });
   bindF(subcatSel, 'subcat'); bindF(tubSel, 'tub'); bindF(diffSel, 'difficulty'); bindF(search, 'q', 'input');
@@ -1931,22 +1955,31 @@ function viewCompile() {
   const drawRound = () => {
     clear(roundHost);
     let filled = 0; const total = slots.length * 2;
-    let curSubject = null; let group = null; let idx = 0;
+    // Group slots by subject (keeping composition order), then render with the
+    // pool's filtered subject surfaced first so it's quick to fill.
+    const groups = [];   // [{ subject, slots: [] }]
     for (const slot of slots) {
-      if (slot.subject !== curSubject) {
-        curSubject = slot.subject;
-        const n = composition.find((c) => c.subject === curSubject)?.pairs || 0;
-        group = el('div', { class: 'compile-group' }, [el('h4', { class: 'compile-group-h', text: `${curSubject} · ${n} pair${n === 1 ? '' : 's'}` })]);
-        roundHost.appendChild(group);
-        idx = 0;
-      }
-      idx++;
+      let g = groups.find((x) => x.subject === slot.subject);
+      if (!g) { g = { subject: slot.subject, slots: [] }; groups.push(g); }
+      g.slots.push(slot);
       if (slot.tu) filled++; if (slot.b) filled++;
-      group.appendChild(el('div', { class: 'compile-pair' }, [
-        el('span', { class: 'compile-pair-n', text: '#' + idx }),
-        slotTarget(slot, 'tu'),
-        slotTarget(slot, 'b'),
-      ]));
+    }
+    if (filters.subject) groups.sort((a, b) => (b.subject === filters.subject) - (a.subject === filters.subject));
+    for (const g of groups) {
+      const surfaced = filters.subject && g.subject === filters.subject;
+      const head = el('h4', { class: 'compile-group-h' + (surfaced ? ' is-surfaced' : '') }, [
+        `${g.subject} · ${g.slots.length} pair${g.slots.length === 1 ? '' : 's'}`,
+        surfaced ? el('span', { class: 'chip', style: 'margin-left:8px', text: 'filtered' }) : null,
+      ]);
+      const groupEl = el('div', { class: 'compile-group' }, [head]);
+      g.slots.forEach((slot, i) => {
+        groupEl.appendChild(el('div', { class: 'compile-pair' }, [
+          el('span', { class: 'compile-pair-n', text: '#' + (i + 1) }),
+          slotTarget(slot, 'tu'),
+          slotTarget(slot, 'b'),
+        ]));
+      });
+      roundHost.appendChild(groupEl);
     }
     roundSummary.textContent = `${filled} / ${total} filled · ${slots.length} pairs`;
   };
@@ -2004,7 +2037,7 @@ function viewCompile() {
     else if (!n) previewHost.appendChild(el('p', { class: 'muted sm', text: 'No complete pairs yet.' }));
   };
 
-  const redraw = () => { drawPool(); drawRound(); drawPreview(); };
+  const redraw = () => { drawPool(); drawRound(); drawPreview(); saveProgress(); };
 
   // ── Export controls (live in the preview panel) ──
   const titleInp = el('input', { class: 'inp sm', value: 'Round', placeholder: 'Round title' });
@@ -2116,9 +2149,20 @@ function viewCompile() {
   app.unsub = S().watchQuestions({ finalized: true }, (rows) => {
     all = rows;
     const byId = new Map(rows.map((r) => [r.id, r]));
-    for (const s of slots) {
-      if (s.tu) s.tu = byId.get(s.tu.id) || null;
-      if (s.b) s.b = byId.get(s.b.id) || null;
+    if (pendingHydrate) {
+      // First load: restore the autosaved assignments by question id. Slots were
+      // rebuilt from the saved composition, so they line up by index.
+      slots.forEach((s, i) => {
+        const saved = pendingHydrate[i];
+        s.tu = saved && saved.tu ? byId.get(saved.tu) || null : null;
+        s.b = saved && saved.b ? byId.get(saved.b) || null : null;
+      });
+      pendingHydrate = null;
+    } else {
+      for (const s of slots) {
+        if (s.tu) s.tu = byId.get(s.tu.id) || null;
+        if (s.b) s.b = byId.get(s.b.id) || null;
+      }
     }
     redraw();
   });

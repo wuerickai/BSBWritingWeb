@@ -360,7 +360,8 @@ input[type=file].inp { padding: 8px; font-size: .85rem; }
 .compile-panel > .compile-comp-bar { flex: none; }
 .compile-round { flex: 1; overflow-y: auto; min-height: 0; }
 .compile-group { margin-bottom: 14px; }
-.compile-group-h { margin: 0 0 8px; font-size: .9rem; color: var(--text); border-bottom: 1px solid var(--line); padding-bottom: 5px; }
+.compile-group-h { margin: 0 0 8px; font-size: .9rem; color: var(--text); border-bottom: 1px solid var(--line); padding-bottom: 5px; display: flex; align-items: center; }
+.compile-group-h.is-surfaced { color: var(--primary); border-color: var(--primary); }
 .compile-pair { display: grid; grid-template-columns: 30px 1fr 1fr; gap: 8px; align-items: stretch; margin-bottom: 8px; }
 .compile-pair-n { color: var(--muted); font-size: .8rem; font-weight: 700; display: flex; align-items: center; }
 .compile-target { border: 1px solid var(--line); border-radius: var(--radius-sm); padding: 8px 10px; background: var(--bg-2); }
