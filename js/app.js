@@ -1736,17 +1736,73 @@ function questionToTex(q) {
   return tex;
 }
 
-// A standalone, compilable document. Defines the custom \pron{} macro the writers
-// use (mhchem supplies \ce{} and \pu{}).
+// Preamble for a standalone, compilable round — the Berkeley Science Bowl round
+// template. Everything from \documentclass up to (but not including)
+// \begin{document}; the \roundnumber macro is prepended per-export.
 const ROUND_TEX_PREAMBLE = [
-  '\\documentclass[11pt]{article}',
-  '\\usepackage[margin=1in]{geometry}',
-  '\\usepackage{amsmath,amssymb}',
+  '\\documentclass[12pt]{article}',
+  '',
+  '\\usepackage{graphicx}',
+  '\\usepackage[top=0.75in, bottom=0.75in, left=0.75in, right=0.75in]{geometry}',
+  '\\usepackage{newtx}',
+  '\\usepackage{multicol}',
+  '\\usepackage{csvsimple}',
+  '\\usepackage{xfp}',
+  '\\usepackage{enumitem}',
+  '\\usepackage{fancyhdr}',
+  '\\usepackage[T1]{fontenc}',
+  '\\usepackage{xcolor}',
+  '',
+  '\\ifdefined\\draftmode',
+  '  \\usepackage{draftwatermark}',
+  '  \\SetWatermarkScale{3}',
+  '\\fi',
+  '',
   '\\usepackage[version=4]{mhchem}',
-  '\\newcommand{\\pron}[1]{[\\textbf{\\textit{#1}}]}',
+  '\\usepackage{amsmath}',
+  '\\usepackage{braket}',
+  '',
+  '\\setlength{\\parindent}{0pt}',
+  '\\pagestyle{fancy}',
+  '\\fancyhf{}',
+  '\\setlength{\\footskip}{100pt}',
+  '\\renewcommand{\\headrulewidth}{0pt}',
+  '\\lfoot{{Berkeley Science Bowl Round \\roundnumber}}',
+  '\\cfoot{\\makebox[\\textwidth][r]{Page \\thepage \\hspace{0.5cm}}}',
+  '',
+  '\\newcommand{\\pron}[1]{\\textit{\\textbf{[#1]}}}',
+  '\\newcommand{\\readas}[1]{(read: \\textit{#1})}',
+  '\\newcommand{\\readernote}[1]{(\\textit{#1})}',
 ].join('\n');
 
-function buildRoundTex(pairs, { title = 'Round', fullDocument = true } = {}) {
+const texArg = (s) => String(s == null ? '' : s).replace(/([#$%&_{}])/g, '\\$1');
+
+// Collect every "<word> \pron{guide}" appearing in the round (question text,
+// answer, and MC choices), de-duplicated, in export order, for the front-page box.
+function collectPronGuides(pairs) {
+  const seen = new Set();
+  const out = [];
+  const scan = (q) => {
+    if (!q) return;
+    const fields = [q.questionText, q.answerLine, q.mcAnswerText,
+      q.choices?.W, q.choices?.X, q.choices?.Y, q.choices?.Z];
+    for (const f of fields) {
+      if (!f) continue;
+      const re = /(\S+)\s*\\pron\{([^}]*)\}/g;
+      let m;
+      while ((m = re.exec(f))) {
+        const word = m[1].replace(/^[([{]+/, '').replace(/[),.;:]+$/, '');
+        const entry = `${word} \\pron{${m[2]}}`;
+        const key = entry.toLowerCase();
+        if (!seen.has(key)) { seen.add(key); out.push(entry); }
+      }
+    }
+  };
+  for (const p of pairs) { scan(p.tu); scan(p.b); }
+  return out;
+}
+
+function buildRoundTex(pairs, { roundNumber = '', fullDocument = true } = {}) {
   const lines = [];
   let n = 1;
   for (const pair of pairs) {
@@ -1759,13 +1815,49 @@ function buildRoundTex(pairs, { title = 'Round', fullDocument = true } = {}) {
   }
   const body = lines.join('\n');
   if (!fullDocument) return body;
-  const safeTitle = String(title || 'Round').replace(/([#$%&_{}])/g, '\\$1');
+
+  const guides = collectPronGuides(pairs);
+  const pronContent = guides.length
+    ? guides.join(' \\\\\n\t\t\t\t')
+    : 'No pronunciation guides.';
+  const pronBox = [
+    '\\begin{center}',
+    '\\setlength{\\fboxsep}{1em}',
+    '\t\t\\fbox{\\parbox{5.5in}{\\centering',
+    `\t\t\t\t${pronContent}`,
+    '\t\t}}',
+    '\\end{center}',
+  ].join('\n');
+
   return [
+    `\\newcommand{\\roundnumber}{${texArg(roundNumber)}}%\\def\\draftmode{1}`,
+    '%\\newcommand{\\timewarning}{9:00}',
+    '% INSERT ROUND NUMBER ABOVE',
+    '',
     ROUND_TEX_PREAMBLE,
-    `\\title{${safeTitle}}`,
-    '\\date{}',
+    '',
     '\\begin{document}',
-    '\\maketitle',
+    '',
+    '\\newgeometry{left=1in, right=1in}',
+    '\\vspace*{1cm}',
+    '\\begin{center}',
+    '  \\begin{huge}',
+    '    {\\fontfamily{lmss}\\selectfont',
+    '      \\textbf{2026 Berkeley Science Bowl}',
+    '      \\vspace{10pt} \\par Round \\roundnumber',
+    '    }',
+    '  \\end{huge}',
+    '\\end{center}',
+    '',
+    '\\vspace{1em}',
+    '',
+    '\\ifdefined\\timewarning',
+    '\\restoregeometry',
+    '\\fi',
+    '',
+    pronBox,
+    '',
+    '\\pagebreak',
     '',
     body,
     '\\end{document}',
@@ -2078,7 +2170,7 @@ function viewCompile() {
   const redraw = () => { drawPool(); drawRound(); drawPreview(); saveProgress(); };
 
   // ── Export controls (live in the preview panel) ──
-  const titleInp = el('input', { class: 'inp sm', value: 'Round', placeholder: 'Round title' });
+  const titleInp = el('input', { class: 'inp sm', value: '1', placeholder: 'e.g. 3', style: 'width:80px' });
   const shuffleChk = el('input', { type: 'checkbox', checked: true });
   const fullDocChk = el('input', { type: 'checkbox', checked: true });
 
@@ -2091,8 +2183,9 @@ function viewCompile() {
       if (!ok) return;
     }
     const ordered = shuffleChk.checked ? interleaveShuffle(complete) : complete;
-    const tex = buildRoundTex(ordered, { title: titleInp.value.trim() || 'Round', fullDocument: fullDocChk.checked });
-    showTexModal(tex, titleInp.value.trim() || 'Round');
+    const round = titleInp.value.trim();
+    const tex = buildRoundTex(ordered, { roundNumber: round, fullDocument: fullDocChk.checked });
+    showTexModal(tex, round ? 'Round ' + round : 'Round');
   };
   const compileBtn = el('button', { class: 'btn primary sm', text: '📄 Compile LaTeX', onclick: compile });
   const resetBtn = el('button', { class: 'btn ghost sm', text: 'Clear', onclick: async () => {
@@ -2117,7 +2210,7 @@ function viewCompile() {
     { key: 'preview', grow: saved.preview?.grow ?? 1.1, hidden: saved.preview?.hidden ?? false, node: el('section', { class: 'compile-panel' }, [
       el('div', { class: 'compile-col-head' }, [el('h3', { text: 'Preview' }), compileBtn]),
       el('div', { class: 'compile-options' }, [
-        field('Title', titleInp),
+        field('Round #', titleInp),
         el('label', { class: 'compile-check' }, [shuffleChk, el('span', { class: 'sm', text: 'Shuffle on export' })]),
         el('label', { class: 'compile-check' }, [fullDocChk, el('span', { class: 'sm', text: 'Full document' })]),
       ]),
