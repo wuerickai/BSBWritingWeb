@@ -16,7 +16,7 @@ import {
 
 const app = { user: null, unsub: null, allQuestions: [], allUnsub: null };
 const view = () => document.getElementById('view');
-const ROUTES = ['write', 'mine', 'review', 'finalized', 'stats', 'graveyard', 'compile', 'admin'];
+const ROUTES = ['write', 'mine', 'mine-finalize', 'review', 'finalized', 'stats', 'graveyard', 'compile', 'admin'];
 
 // Questions that still count as "live" — everything not moved to the Graveyard.
 // The global feed keeps archived questions (so they stay backed up); dedupe and
@@ -147,11 +147,16 @@ function renderHeader() {
     const tabs = [
       ['write', '✎ Write'],
       ['mine', '◳ My Questions'],
+    ];
+    // Admins get a lane to sort through and sign off on their own submitted
+    // questions (self-finalizing is admin-only).
+    if (app.user.role === 'admin') tabs.push(['mine-finalize', '✔ Finalize Mine']);
+    tabs.push(
       ['review', '⚖ Review Queue'],
       ['finalized', '★ Finalized'],
       ['stats', '𝛴 Statistics'],
       ['graveyard', '🪦 Graveyard'],
-    ];
+    );
     if (app.user.role === 'admin') tabs.push(['compile', '📄 Compile'], ['admin', '⚙ Admin']);
     const nav = el('nav', { class: 'tabs' });
     const cur = currentRoute();
@@ -355,6 +360,7 @@ function routeTo(route) {
   switch (route) {
     case 'write': return viewWrite();
     case 'mine': return viewMine();
+    case 'mine-finalize': return app.user.role === 'admin' ? viewMineFinalize() : viewMine();
     case 'review': return viewReview();
     case 'finalized': return viewFinalized();
     case 'stats': return viewStats();
@@ -1173,6 +1179,110 @@ function myCard(q) {
 
 function emptyState(text, btnText, onClick) {
   return el('div', { class: 'empty' }, [el('p', { text }), btnText ? el('button', { class: 'btn primary', text: btnText, onclick: onClick }) : null]);
+}
+
+// ── View: Finalize Mine ───────────────────────────────────────────────────────
+// A private counterpart to the Review Queue: sort through your OWN submitted
+// questions and sign the ones that are ready off into the finalized database.
+function viewMineFinalize() {
+  const host = clear(view());
+  const filters = { subject: '', type: '', tub: '', difficulty: '', sort: 'newest' };
+  const controls = reviewControls(filters, () => apply());
+  const listHost = el('div', { class: 'qlist' });
+
+  let all = [];
+  let current = [];
+  const testsolveBtn = el('button', {
+    class: 'btn ghost', text: '🎯 Testsolve', title: 'Try your questions with the answers hidden before finalizing',
+    onclick: () => openTestsolve(current),
+  });
+
+  host.appendChild(el('div', { class: 'page' }, [
+    el('div', { class: 'page-head row-between' }, [
+      el('div', {}, [el('h1', { text: 'Finalize mine' }), el('p', { class: 'muted', text: 'Your own questions that are in review. Sort through them and finalize the ones that are ready.' })]),
+      testsolveBtn,
+    ]),
+    controls, listHost,
+  ]));
+
+  const apply = () => {
+    current = all.filter((q) => (!filters.subject || q.subject === filters.subject)
+      && (!filters.type || q.type === filters.type)
+      && (!filters.tub || q.tub === filters.tub)
+      && (!filters.difficulty || String(q.difficulty) === filters.difficulty));
+    current.sort(sorters[filters.sort]);
+    testsolveBtn.disabled = current.length === 0;
+    clear(listHost);
+    if (!current.length) { listHost.appendChild(emptyState('None of your questions are waiting to be finalized. 🎉')); return; }
+    for (const q of current) listHost.appendChild(mineFinalizeCard(q));
+  };
+
+  app.unsub = S().watchQuestions({ states: ['in_review'], mine: true }, (rows) => { all = rows; apply(); });
+}
+
+function mineFinalizeCard(q) {
+  const pend = pendingCount(q);
+  return el('div', { class: 'qcard' }, [
+    el('div', { class: 'qcard-main' }, [
+      el('div', { class: 'qcard-top' }, [
+        el('span', { class: 'qid', text: '#' + q.humanId }),
+        el('span', { class: 'chip warn', text: 'Review #' + q.status }),
+        el('span', { class: 'chip', text: `${q.tub} · ${q.type}` }),
+        el('span', { class: 'chip', text: q.subject }),
+        el('span', { class: 'chip subtle', text: q.subcat }),
+        el('span', { class: 'chip subtle', text: 'Diff ' + (q.difficulty ?? '—') }),
+        editLoad(q) ? el('span', { class: 'chip subtle', text: `${editLoad(q)} edit${editLoad(q) > 1 ? 's' : ''}/sugg.` }) : el('span', { class: 'chip subtle', text: 'untouched' }),
+        pend ? el('span', { class: 'chip warn', text: `✎ ${pend} to resolve` }) : null,
+      ]),
+      el('div', { class: 'qcard-text', html: renderMixedToString(q.questionText).slice(0, 600) }),
+    ]),
+    el('div', { class: 'card-actions' }, [el('button', { class: 'btn primary sm', text: 'Open', onclick: () => openSelfFinalize(q) })]),
+  ]);
+}
+
+// Review one of your own questions and finalize it (or edit / remove it first).
+// No request-changes / suggestion controls here — it's yours, so you just edit.
+function openSelfFinalize(q) {
+  const msg = el('div', { class: 'form-msg' });
+
+  const live = el('div', {});
+  const renderLive = (cur) => {
+    clear(live);
+    if (!cur) { live.appendChild(el('p', { text: 'This question is no longer available.' })); return; }
+    if (cur.state === 'finalized') { live.appendChild(el('div', { class: 'attn-banner' }, [el('strong', { text: 'Finalized ★' }), el('span', { text: ' — this question is now in the finalized database.' })])); }
+    live.appendChild(questionDetail(cur));
+    const pend = pendingCount(cur);
+    if (pend > 0) {
+      live.appendChild(el('hr', {}));
+      live.appendChild(el('div', { class: 'attn-banner' }, [el('span', { class: 'attn-dot' }), el('strong', { text: 'Heads up' }), el('span', { text: ` — ${pend} suggested edit${pend > 1 ? 's' : ''} still pending. Resolve ${pend > 1 ? 'them' : 'it'} from the editor before finalizing.` })]));
+    }
+  };
+  const stop = S().watchOne(q.id, renderLive);
+
+  const body = el('div', {}, [
+    live,
+    el('hr', {}),
+    msg,
+    el('div', { class: 'row-end gap', style: 'margin-top:14px' }, [
+      el('button', { class: 'btn ghost sm', text: '🎯 Testsolve', title: 'Try it with the answer hidden', onclick: () => openTestsolve([q]) }),
+      el('button', { class: 'btn sm', text: 'Edit', title: 'Edit or resolve suggestions before finalizing', onclick: () => { m.close(); openEditor(q); } }),
+      canArchive(q) ? el('button', {
+        class: 'btn danger sm', text: '🪦 Remove', title: 'Take this out of the pipeline (kept in the Graveyard)',
+        onclick: () => archiveDialog(q, () => m.close()),
+      }) : null,
+      el('button', {
+        class: 'btn primary', text: 'Finalize ★', onclick: async () => {
+          const prompt = pendingCount(q) > 0
+            ? 'This question still has pending suggested edits. Finalize anyway?'
+            : 'Finalize your question and move it to the finalized database?';
+          if (!(await confirmDialog(prompt, { confirmText: 'Finalize' }))) return;
+          try { await S().finalize(q.id); toast('Finalized! 🎉', 'success'); m.close(); }
+          catch (e) { msg.className = 'form-msg error'; msg.textContent = explainError(e); }
+        },
+      }),
+    ]),
+  ]);
+  const m = modal(`Finalize your question #${q.humanId}`, body, { wide: true, onClose: stop });
 }
 
 // ── View: Review Queue ────────────────────────────────────────────────────────────
