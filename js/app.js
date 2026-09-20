@@ -11,7 +11,7 @@ import { findDuplicates, diffToHtml, hasChanges, checkFormat, mergeEdit } from '
 import { csvToQuestions } from './csv.js';
 import * as Backup from './backup.js';
 import {
-  el, clear, fillSelect, toast, modal, confirmDialog, fmtDate, stateBadge, debounce, STATE_META,
+  el, clear, fillSelect, toast, modal, confirmDialog, promptDialog, fmtDate, stateBadge, debounce, STATE_META,
 } from './ui.js';
 
 const app = { user: null, unsub: null, allQuestions: [], allUnsub: null };
@@ -1993,32 +1993,95 @@ function interleaveShuffle(pairs) {
   return out;
 }
 
+// ── Compile drafts (localStorage) ─────────────────────────────────────────────────
+// A round draft records its composition, the question id sitting in every slot,
+// the round number, and the export options. Drafts are SHARED across admins and
+// persisted to the backend (Firestore in firebase mode); slot ids are re-hydrated
+// to live question objects when a draft is opened. Which tabs a person has open is
+// per-device UI state kept in localStorage (see UI_KEY below), not synced.
+const COMPILE_UI_KEY = 'sbq-compile-ui';
+const LEGACY_DRAFTS_KEY = 'sbq-compile-drafts';      // pre-sync local bundle
+const LEGACY_PROGRESS_KEY = 'sbq-compile-progress';  // original single autosave
+
+function blankDraftState() {
+  return {
+    composition: T.ROUND_COMPOSITION.map((c) => ({ subject: c.subject, pairs: c.pairs })),
+    slots: [],
+    roundNumber: '1',
+    shuffle: true,
+    fullDoc: true,
+  };
+}
+
+function newDraftState(name, state) {
+  const base = blankDraftState();
+  const s = state || {};
+  return {
+    name: name || 'Untitled draft',
+    composition: (Array.isArray(s.composition) ? s.composition : base.composition).map((c) => ({ subject: c.subject, pairs: c.pairs })),
+    slots: (Array.isArray(s.slots) ? s.slots : base.slots).map((x) => ({ subject: x.subject, tu: x.tu || null, b: x.b || null })),
+    roundNumber: s.roundNumber ?? base.roundNumber,
+    shuffle: s.shuffle ?? base.shuffle,
+    fullDoc: s.fullDoc ?? base.fullDoc,
+  };
+}
+
+// Upload any drafts left in localStorage by the pre-sync version so a compiler's
+// in-progress work survives the switch to backend-synced drafts. Runs once (it
+// clears the local keys afterwards). Returns true if it created anything.
+async function migrateLegacyDrafts() {
+  const toCreate = [];
+  let bundle = null, legacy = null;
+  try { bundle = JSON.parse(localStorage.getItem(LEGACY_DRAFTS_KEY) || 'null'); } catch {}
+  try { legacy = JSON.parse(localStorage.getItem(LEGACY_PROGRESS_KEY) || 'null'); } catch {}
+  if (bundle && Array.isArray(bundle.drafts) && bundle.drafts.length) {
+    for (const d of bundle.drafts) toCreate.push(newDraftState(d.name, d));
+  } else if (legacy) {
+    toCreate.push(newDraftState('Draft 1', legacy));
+  }
+  for (const st of toCreate) { try { await S().saveCompileDraft(st); } catch (e) { console.error('migrate draft', e); } }
+  if (toCreate.length) { try { localStorage.removeItem(LEGACY_DRAFTS_KEY); localStorage.removeItem(LEGACY_PROGRESS_KEY); } catch {} }
+  return toCreate.length > 0;
+}
+
 // ── View: Compile a round ─────────────────────────────────────────────────────────
 // Admin-only. Pick finalized questions into a 23-pair round (4 per main subject +
 // 3 Energy) as Toss-ups / Bonuses, live-edit any finalized question, preview the
 // rendered round, then export LaTeX in the BSBcompile format. The three panels
 // (Pool · Builder · Preview) can be resized by dragging the gutters or hidden.
+// Work happens inside a named draft; drafts are shared and backend-synced, and a
+// person can keep several open as tabs, each autosaving as they go.
 function viewCompile() {
   const host = clear(view());
 
-  // Round state: a flat list of pair slots, each bound to a subject.
-  // Progress (composition + which question sits in each slot) autosaves to
-  // localStorage and is restored — by question id — when the pool loads.
-  const PROGRESS_KEY = 'sbq-compile-progress';
-  const savedProgress = (() => { try { return JSON.parse(localStorage.getItem(PROGRESS_KEY) || 'null'); } catch { return null; } })();
+  // The active draft's contents are held in an editable working copy (composition
+  // + slots + export options below); it autosaves to the backend as it changes.
+  // The shared draft list arrives live from the backend; open tabs / active draft
+  // are per-device UI state in localStorage.
+  let drafts = [];        // shared drafts from the backend (last-saved snapshots)
+  let creatingSeed = false; // guards the "no drafts yet → make one" bootstrap
+  const ui = (() => { try { return JSON.parse(localStorage.getItem(COMPILE_UI_KEY) || 'null') || {}; } catch { return {}; } })();
+  let openIds = Array.isArray(ui.openIds) ? ui.openIds.slice() : [];
+  let activeId = ui.activeId || null;
+  let loadedWorkingId = null; // which draft the working copy currently reflects
+  const saveUi = () => { try { localStorage.setItem(COMPILE_UI_KEY, JSON.stringify({ openIds, activeId })); } catch {} };
+  const getDraft = (id) => drafts.find((d) => d.id === id);
 
-  let composition = T.ROUND_COMPOSITION.map((c) => ({ ...c }));
-  if (savedProgress?.composition) {
-    for (const c of composition) {
-      const m = savedProgress.composition.find((x) => x.subject === c.subject);
-      if (m && Number.isFinite(m.pairs)) c.pairs = m.pairs;
-    }
+  function mergeComposition(comp) {
+    return T.ROUND_COMPOSITION.map((c) => {
+      const m = Array.isArray(comp) ? comp.find((x) => x.subject === c.subject) : null;
+      return { subject: c.subject, pairs: m && Number.isFinite(m.pairs) ? m.pairs : c.pairs };
+    });
   }
+
+  let composition = mergeComposition(null);
   let slots = [];       // { key, subject, tu: q|null, b: q|null }
   let seq = 0;
   let all = [];         // finalized questions
-  // Slot→id assignments awaiting hydration from the first finalized-question load.
-  let pendingHydrate = Array.isArray(savedProgress?.slots) ? savedProgress.slots : null;
+  let byId = new Map(); // id → live finalized question
+  let byLoaded = false; // true once the finalized pool has arrived at least once
+  // Slot→id assignments awaiting hydration from the finalized-question load.
+  let pendingHydrate = null;
 
   const buildSlots = (preserve = true) => {
     const old = slots;
@@ -2033,15 +2096,33 @@ function viewCompile() {
   };
   buildSlots(false);
 
-  const saveProgress = () => {
-    if (pendingHydrate) return; // don't overwrite saved assignments before they're restored
+  // Restore saved slot→id assignments (aligned by index to freshly built slots).
+  const hydrateSlots = (saved) => {
+    slots.forEach((s, i) => {
+      const sv = Array.isArray(saved) ? saved[i] : null;
+      s.tu = sv && sv.tu ? byId.get(sv.tu) || null : null;
+      s.b = sv && sv.b ? byId.get(sv.b) || null : null;
+    });
+  };
+
+  // Push the working copy to the backend under the active draft (debounced).
+  const flushSave = async () => {
+    if (!activeId || loadedWorkingId !== activeId || pendingHydrate) return;
     try {
-      localStorage.setItem(PROGRESS_KEY, JSON.stringify({
+      const saved = await S().saveCompileDraft({
+        id: activeId,
+        name: getDraft(activeId)?.name || 'Untitled draft',
         composition: composition.map((c) => ({ subject: c.subject, pairs: c.pairs })),
         slots: slots.map((s) => ({ subject: s.subject, tu: s.tu?.id || null, b: s.b?.id || null })),
-      }));
-    } catch {}
+        roundNumber: titleInp.value.trim(),
+        shuffle: shuffleChk.checked,
+        fullDoc: fullDocChk.checked,
+      });
+      const cur = getDraft(activeId);
+      if (cur) Object.assign(cur, saved); // keep the local snapshot fresh (updatedAt)
+    } catch (e) { console.error('saveCompileDraft', e); toast('Couldn’t save the draft.', 'warn'); }
   };
+  const queueSave = debounce(flushSave, 700);
 
   const usedIds = () => new Set(slots.flatMap((s) => [s.tu?.id, s.b?.id].filter(Boolean)));
 
@@ -2123,11 +2204,22 @@ function viewCompile() {
   const roundSummary = el('span', { class: 'muted sm' });
   const compTotal = el('span', { class: 'muted sm' });
   const compRow = el('div', { class: 'compile-comp' });
+  const compInputs = {}; // subject → number input, so drafts can reset the values
   for (const c of composition) {
+    const subject = c.subject;
     const inp = el('input', { type: 'number', min: '0', max: '20', value: String(c.pairs), class: 'inp sm', style: 'width:58px' });
-    inp.addEventListener('change', () => { c.pairs = Math.max(0, parseInt(inp.value, 10) || 0); inp.value = String(c.pairs); applyComposition(); });
-    compRow.appendChild(el('label', { class: 'compile-comp-item' }, [el('span', { class: 'sm', text: c.subject }), inp]));
+    inp.addEventListener('change', () => {
+      const v = Math.max(0, parseInt(inp.value, 10) || 0); inp.value = String(v);
+      const cur = composition.find((x) => x.subject === subject); if (cur) cur.pairs = v;
+      applyComposition();
+    });
+    compInputs[subject] = inp;
+    compRow.appendChild(el('label', { class: 'compile-comp-item' }, [el('span', { class: 'sm', text: subject }), inp]));
   }
+  const setComposition = (comp) => {
+    composition = mergeComposition(comp);
+    for (const c of composition) { const inp = compInputs[c.subject]; if (inp) inp.value = String(c.pairs); }
+  };
 
   // Drag a filled Toss-up/Bonus onto another slot of the SAME subject to re-pair:
   // an empty target moves the question; an occupied target swaps the two.
@@ -2224,11 +2316,179 @@ function viewCompile() {
     roundSummary.textContent = `${filled} / ${total} filled · ${slots.length} pairs`;
   };
 
-  const applyComposition = () => {
+  const updateCompTotal = () => {
     const total = composition.reduce((n, c) => n + c.pairs, 0);
     compTotal.textContent = `${total} pairs · ${total * 2} questions`;
+  };
+  const applyComposition = () => {
+    updateCompTotal();
     buildSlots(true);
     redraw();
+  };
+
+  // ── Draft tabs ──
+  const draftBar = el('div', { class: 'compile-drafts' });
+  let refreshManager = null; // set while the drafts manager modal is open
+
+  // Load a draft's saved contents into the editable working copy. Does NOT save —
+  // it's a read into the builder (live remote edits reach non-active drafts, but
+  // the active draft's working copy is only replaced when the person switches to a
+  // different one, so in-progress edits are never clobbered).
+  const loadWorkingFromDraft = (id) => {
+    const d = getDraft(id);
+    if (!d) { loadedWorkingId = null; return; }
+    loadedWorkingId = id;
+    setComposition(d.composition);
+    titleInp.value = d.roundNumber ?? '';
+    shuffleChk.checked = d.shuffle !== false;
+    fullDocChk.checked = d.fullDoc !== false;
+    updateCompTotal();
+    buildSlots(false);
+    if (byLoaded) { hydrateSlots(d.slots); pendingHydrate = null; }
+    else pendingHydrate = d.slots || null;
+    drawDraftBar();
+    refreshManager?.();
+    drawAll();
+  };
+
+  const loadDraft = (id) => {
+    if (id === activeId && loadedWorkingId === id) return;
+    flushSave();                          // persist the outgoing draft first
+    activeId = id;
+    if (!openIds.includes(id)) openIds.push(id);
+    saveUi();
+    loadWorkingFromDraft(id);
+  };
+
+  const openSavedDraft = async (state, refresh) => {
+    await flushSave();
+    let saved;
+    try { saved = await S().saveCompileDraft(state); }
+    catch (e) { console.error('create draft', e); toast('Couldn’t create the draft.', 'warn'); return; }
+    drafts = [saved, ...drafts.filter((d) => d.id !== saved.id)];
+    if (!openIds.includes(saved.id)) openIds.push(saved.id);
+    activeId = saved.id;
+    saveUi();
+    loadWorkingFromDraft(saved.id);
+    if (refresh) refreshManager?.();
+  };
+
+  const newDraft = async () => {
+    const name = await promptDialog('Name this draft', { value: 'Draft ' + (drafts.length + 1), confirmText: 'Create' });
+    if (!name) return;
+    await openSavedDraft(newDraftState(name), true);
+  };
+
+  const duplicateDraft = (id) => {
+    const src = getDraft(id); if (!src) return;
+    openSavedDraft(newDraftState('Copy of ' + src.name, src), true);
+  };
+
+  const renameDraft = async (id) => {
+    const d = getDraft(id); if (!d) return;
+    const name = await promptDialog('Rename draft', { value: d.name });
+    if (!name) return;
+    d.name = name; // optimistic; the watch will confirm
+    drawDraftBar(); refreshManager?.();
+    try {
+      if (id === activeId) await flushSave(); // saves the new name with the working copy
+      else await S().saveCompileDraft({ id, name, composition: d.composition, slots: d.slots, roundNumber: d.roundNumber, shuffle: d.shuffle, fullDoc: d.fullDoc });
+    } catch (e) { console.error('rename draft', e); toast('Couldn’t rename the draft.', 'warn'); }
+  };
+
+  const closeDraftTab = (id) => {
+    if (openIds.length <= 1) { toast('At least one draft stays open.', 'warn'); return; }
+    const wasActive = activeId === id;
+    openIds = openIds.filter((x) => x !== id);
+    saveUi();
+    if (wasActive) { activeId = openIds[openIds.length - 1]; loadWorkingFromDraft(activeId); }
+    else { drawDraftBar(); refreshManager?.(); }
+  };
+
+  const deleteDraft = async (id) => {
+    const d = getDraft(id); if (!d) return false;
+    if (!(await confirmDialog(`Delete draft “${d.name}”? This deletes it for everyone and can’t be undone.`, { danger: true, confirmText: 'Delete' }))) return false;
+    try { await S().deleteCompileDraft(id); }
+    catch (e) { console.error('delete draft', e); toast('Couldn’t delete the draft.', 'warn'); return false; }
+    drafts = drafts.filter((x) => x.id !== id);
+    openIds = openIds.filter((x) => x !== id);
+    if (!drafts.length) { activeId = null; openIds = []; saveUi(); await openSavedDraft(newDraftState('Draft 1'), true); return true; }
+    if (activeId === id) {
+      activeId = openIds[0] || drafts[0].id;
+      if (!openIds.includes(activeId)) openIds.push(activeId);
+      saveUi();
+      loadWorkingFromDraft(activeId);
+    } else { saveUi(); drawDraftBar(); }
+    refreshManager?.();
+    return true;
+  };
+
+  const openDraftManager = () => {
+    const listHost = el('div', { class: 'draft-manager' });
+    const render = () => {
+      clear(listHost);
+      if (!drafts.length) { listHost.appendChild(el('p', { class: 'muted sm', text: 'No drafts yet.' })); return; }
+      const sorted = [...drafts].sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+      for (const d of sorted) {
+        const isOpen = openIds.includes(d.id);
+        const isActive = d.id === activeId;
+        const filled = (d.slots || []).reduce((n, s) => n + (s.tu ? 1 : 0) + (s.b ? 1 : 0), 0);
+        const by = d.updatedByName ? ` · by ${d.updatedByName}` : '';
+        listHost.appendChild(el('div', { class: 'draft-manager-row' + (isActive ? ' active' : '') }, [
+          el('div', { class: 'grow' }, [
+            el('strong', { text: d.name }),
+            isActive ? el('span', { class: 'chip', style: 'margin-left:8px', text: 'active' }) : (isOpen ? el('span', { class: 'chip subtle', style: 'margin-left:8px', text: 'open' }) : null),
+            el('div', { class: 'muted sm', text: `Round ${d.roundNumber || '—'} · ${filled} question${filled === 1 ? '' : 's'} placed · updated ${fmtDate(d.updatedAt)}${by}` }),
+          ]),
+          el('div', { class: 'row-end gap' }, [
+            el('button', { class: 'btn ' + (isActive ? 'ghost' : 'primary') + ' sm', text: isActive ? 'Active' : (isOpen ? 'Switch to' : 'Open'), disabled: isActive, onclick: () => loadDraft(d.id) }),
+            el('button', { class: 'btn ghost sm', text: 'Rename', onclick: () => renameDraft(d.id) }),
+            el('button', { class: 'btn ghost sm', text: 'Duplicate', onclick: () => duplicateDraft(d.id) }),
+            el('button', { class: 'btn danger sm', text: 'Delete', onclick: () => deleteDraft(d.id) }),
+          ]),
+        ]));
+      }
+    };
+    render();
+    refreshManager = render;
+    modal('Round drafts', listHost, { wide: true, onClose: () => { refreshManager = null; } });
+  };
+
+  function drawDraftBar() {
+    clear(draftBar);
+    draftBar.appendChild(el('span', { class: 'filter-label', text: 'Drafts' }));
+    const tabs = el('div', { class: 'draft-tabs' });
+    for (const id of openIds) {
+      const d = getDraft(id); if (!d) continue;
+      const isActive = id === activeId;
+      tabs.appendChild(el('div', { class: 'draft-tab' + (isActive ? ' active' : '') }, [
+        el('button', { class: 'draft-tab-name', text: d.name, title: 'Updated ' + fmtDate(d.updatedAt) + ' · double-click to rename', onclick: () => loadDraft(id), ondblclick: () => renameDraft(id) }),
+        el('button', { class: 'draft-tab-x', text: '✕', title: 'Close tab (the draft is kept)', onclick: (e) => { e.stopPropagation(); closeDraftTab(id); } }),
+      ]));
+    }
+    draftBar.appendChild(tabs);
+    draftBar.appendChild(el('button', { class: 'btn ghost sm', text: '+ New', title: 'Start a new round draft', onclick: newDraft }));
+    draftBar.appendChild(el('button', { class: 'btn ghost sm', text: '⋯ Manage', title: 'Open, rename, duplicate or delete saved drafts', onclick: openDraftManager }));
+  }
+
+  // Reconcile the live shared draft list into local UI state. Keeps the active
+  // working copy intact unless the active draft changed or vanished.
+  const applyDraftsSnapshot = async (rows) => {
+    drafts = rows;
+    if (!rows.length) {
+      if (creatingSeed) return;
+      creatingSeed = true;
+      const migrated = await migrateLegacyDrafts();
+      if (!migrated) { try { await S().saveCompileDraft(newDraftState('Draft 1')); } catch (e) { console.error('seed draft', e); } }
+      creatingSeed = false;
+      return; // the next snapshot carries the created draft(s)
+    }
+    openIds = openIds.filter((id) => drafts.some((d) => d.id === id));
+    if (!openIds.length) openIds = [drafts[0].id];
+    if (!openIds.includes(activeId)) activeId = openIds[0];
+    saveUi();
+    if (loadedWorkingId !== activeId) loadWorkingFromDraft(activeId);
+    else { drawDraftBar(); refreshManager?.(); }
   };
 
   // ── Preview (right) — rendered round in export order (build order) ──
@@ -2277,12 +2537,16 @@ function viewCompile() {
     else if (!n) previewHost.appendChild(el('p', { class: 'muted sm', text: 'No complete pairs yet.' }));
   };
 
-  const redraw = () => { drawPool(); drawRound(); drawPreview(); saveProgress(); };
+  const drawAll = () => { drawPool(); drawRound(); drawPreview(); };
+  const redraw = () => { drawAll(); queueSave(); };
 
   // ── Export controls (live in the preview panel) ──
   const titleInp = el('input', { class: 'inp sm', value: '1', placeholder: 'e.g. 3', style: 'width:80px' });
   const shuffleChk = el('input', { type: 'checkbox', checked: true });
   const fullDocChk = el('input', { type: 'checkbox', checked: true });
+  titleInp.addEventListener('input', queueSave);
+  shuffleChk.addEventListener('change', queueSave);
+  fullDocChk.addEventListener('change', queueSave);
 
   const compile = async () => {
     const complete = slots.filter((s) => s.tu && s.b);
@@ -2377,36 +2641,42 @@ function viewCompile() {
   host.appendChild(el('div', { class: 'page compile-page' }, [
     el('div', { class: 'page-head' }, [
       el('h1', { text: 'Compile a round' }),
-      el('p', { class: 'muted', text: 'Assign finalized questions into Toss-up / Bonus pairs, edit them live, preview the round, then export LaTeX. Drag the gutters to resize; use Panels to hide sections.' }),
+      el('p', { class: 'muted', text: 'Assign finalized questions into Toss-up / Bonus pairs, edit them live, preview the round, then export LaTeX. Work in a draft — keep several open as tabs; each autosaves. Drag the gutters to resize; use Panels to hide sections.' }),
     ]),
+    draftBar,
     toggleBar,
     splitHost,
   ]));
 
+  drawDraftBar();
   layout();
   applyComposition();
-  // Live: re-sync slot references by id so admin edits (and any (un)finalizing)
-  // reflect immediately in the builder and preview.
-  app.unsub = S().watchQuestions({ finalized: true }, (rows) => {
+
+  // Two live subscriptions: the finalized pool (so admin edits and (un)finalizing
+  // reflect immediately) and the shared set of round drafts.
+  const unsubs = [];
+  app.unsub = () => { for (const fn of unsubs) { try { fn(); } catch {} } };
+
+  unsubs.push(S().watchQuestions({ finalized: true }, (rows) => {
     all = rows;
-    const byId = new Map(rows.map((r) => [r.id, r]));
+    byId = new Map(rows.map((r) => [r.id, r]));
+    byLoaded = true;
     if (pendingHydrate) {
-      // First load: restore the autosaved assignments by question id. Slots were
-      // rebuilt from the saved composition, so they line up by index.
-      slots.forEach((s, i) => {
-        const saved = pendingHydrate[i];
-        s.tu = saved && saved.tu ? byId.get(saved.tu) || null : null;
-        s.b = saved && saved.b ? byId.get(saved.b) || null : null;
-      });
+      // Restore the draft's saved assignments by question id. Slots were rebuilt
+      // from the draft's composition, so they line up by index.
+      hydrateSlots(pendingHydrate);
       pendingHydrate = null;
     } else {
+      // Live-refresh existing slot references so admin edits/(un)finalizing show.
       for (const s of slots) {
         if (s.tu) s.tu = byId.get(s.tu.id) || null;
         if (s.b) s.b = byId.get(s.b.id) || null;
       }
     }
-    redraw();
-  });
+    drawAll(); // a finalized-pool change shouldn't rewrite the draft
+  }));
+
+  unsubs.push(S().watchCompileDrafts((rows) => { applyDraftsSnapshot(rows); }));
 }
 
 function showTexModal(tex, title) {

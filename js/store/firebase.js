@@ -410,6 +410,52 @@ export async function bulkUpsert(questions) {
   return questions.length;
 }
 
+// ── Compile round drafts (shared among admins) ────────────────────────────────
+// Each round draft is one document in `compileDrafts`. Any admin sees and edits
+// the shared set; which draft tabs a person has open is per-device UI state kept
+// in the client's localStorage, not here. firestore.rules restricts this
+// collection to admins (the Compile view is admin-only).
+function draftShape(u, data) {
+  return {
+    name: data.name || 'Untitled draft',
+    composition: data.composition || [],
+    slots: data.slots || [],
+    roundNumber: data.roundNumber || '',
+    shuffle: data.shuffle !== false,
+    fullDoc: data.fullDoc !== false,
+    updatedAt: now(),
+    updatedByUid: u.uid,
+    updatedByName: u.displayName || u.email,
+  };
+}
+
+export async function saveCompileDraft(draft) {
+  const u = requireUser();
+  const { id } = draft;
+  const data = draftShape(u, draft);
+  if (id) {
+    await F.setDoc(F.doc(db, 'compileDrafts', id), data, { merge: true });
+    return { id, ...data };
+  }
+  data.createdAt = now();
+  data.createdByUid = u.uid;
+  data.createdByName = u.displayName || u.email;
+  const ref = await F.addDoc(F.collection(db, 'compileDrafts'), data);
+  return { id: ref.id, ...data };
+}
+
+export async function deleteCompileDraft(id) {
+  await F.deleteDoc(F.doc(db, 'compileDrafts', id));
+}
+
+export function watchCompileDrafts(cb) {
+  return F.onSnapshot(F.query(F.collection(db, 'compileDrafts')), (snap) => {
+    const arr = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+    arr.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+    cb(arr);
+  }, (err) => { console.error('watchCompileDrafts', err); cb([]); });
+}
+
 export function watchOne(id, cb) {
   return F.onSnapshot(F.doc(db, 'questions', id), (snap) => cb(snap.exists() ? { id: snap.id, ...snap.data() } : null));
 }

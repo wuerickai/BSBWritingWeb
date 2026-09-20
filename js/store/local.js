@@ -13,6 +13,7 @@ const K_USERS = 'sbq_users';
 const K_QUESTIONS = 'sbq_questions';
 const K_SESSION = 'sbq_session';
 const K_COUNTER = 'sbq_counter';
+const K_COMPILE = 'sbq_compile_drafts';
 
 const read = (k, d) => { try { return JSON.parse(localStorage.getItem(k)) ?? d; } catch { return d; } };
 const write = (k, v) => localStorage.setItem(k, JSON.stringify(v));
@@ -20,6 +21,7 @@ const write = (k, v) => localStorage.setItem(k, JSON.stringify(v));
 let _user = null;                 // cached current user (full shape) or null
 const authListeners = new Set();
 const dataListeners = new Set();
+const compileListeners = new Set();
 
 async function sha256(text) {
   const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
@@ -30,6 +32,7 @@ const now = () => Date.now();
 
 function emitData() { dataListeners.forEach((fn) => fn()); }
 function emitAuth() { authListeners.forEach((fn) => fn(_user)); }
+function emitCompile() { compileListeners.forEach((fn) => fn()); }
 
 function userShape(rec) {
   if (!rec) return null;
@@ -55,6 +58,7 @@ export async function init() {
   // cross-tab updates
   window.addEventListener('storage', (e) => {
     if (e.key === K_QUESTIONS || e.key === K_USERS) emitData();
+    if (e.key === K_COMPILE) emitCompile();
     if (e.key === K_SESSION) { loadSession(); emitAuth(); }
   });
 }
@@ -404,6 +408,47 @@ export async function bulkUpsert(questions) {
   write(K_COUNTER, Math.max(read(K_COUNTER, 0), merged.reduce((m, q) => Math.max(m, q.humanId || 0), 0)));
   saveQuestions(merged);
   return merged.length;
+}
+
+// ── Compile round drafts (shared) ─────────────────────────────────────────────
+// Mirrors the firebase backend: one shared set of round drafts. Open tabs live in
+// per-device UI state (the app keeps those in a separate localStorage key).
+export async function saveCompileDraft(draft) {
+  const u = requireUser();
+  const arr = read(K_COMPILE, []);
+  const existing = draft.id ? arr.find((d) => d.id === draft.id) : null;
+  const data = {
+    name: draft.name || 'Untitled draft',
+    composition: draft.composition || [],
+    slots: draft.slots || [],
+    roundNumber: draft.roundNumber || '',
+    shuffle: draft.shuffle !== false,
+    fullDoc: draft.fullDoc !== false,
+    updatedAt: now(),
+    updatedByUid: u.uid,
+    updatedByName: u.displayName || u.email,
+  };
+  let rec;
+  if (existing) { Object.assign(existing, data); rec = existing; }
+  else {
+    rec = { id: newId(), createdAt: now(), createdByUid: u.uid, createdByName: u.displayName || u.email, ...data };
+    arr.push(rec);
+  }
+  write(K_COMPILE, arr);
+  emitCompile();
+  return { ...rec };
+}
+
+export async function deleteCompileDraft(id) {
+  write(K_COMPILE, read(K_COMPILE, []).filter((d) => d.id !== id));
+  emitCompile();
+}
+
+export function watchCompileDrafts(cb) {
+  const run = () => cb(read(K_COMPILE, []).slice().sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0)));
+  compileListeners.add(run);
+  run();
+  return () => compileListeners.delete(run);
 }
 
 // Live subscription to a single question (for open suggestion panels).

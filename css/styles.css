@@ -336,6 +336,20 @@ input[type=file].inp { padding: 8px; font-size: .85rem; }
 
 /* ── Compile round ───────────────────────────────────────────────────────────── */
 .compile-page { max-width: none; }
+.compile-drafts { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+.draft-tabs { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.draft-tab { display: inline-flex; align-items: center; border: 1px solid var(--line); border-radius: 999px; background: var(--panel); overflow: hidden; }
+.draft-tab.active { border-color: var(--primary); background: var(--primary); }
+.draft-tab-name { border: 0; background: transparent; color: var(--text); font: inherit; font-size: .82rem; font-weight: 600; padding: 5px 4px 5px 12px; cursor: pointer; }
+.draft-tab.active .draft-tab-name { color: #fff; }
+.draft-tab-x { border: 0; background: transparent; color: var(--muted); font-size: .72rem; padding: 5px 10px 5px 6px; cursor: pointer; line-height: 1; }
+.draft-tab-x:hover { color: var(--danger); }
+.draft-tab.active .draft-tab-x { color: rgba(255,255,255,.7); }
+.draft-tab.active .draft-tab-x:hover { color: #fff; }
+.draft-manager { display: flex; flex-direction: column; gap: 8px; }
+.draft-manager-row { display: flex; align-items: center; gap: 12px; padding: 10px 12px; border: 1px solid var(--line); border-radius: var(--radius-sm); background: var(--bg-2); }
+.draft-manager-row.active { border-color: var(--primary); }
+.draft-manager-row .grow { flex: 1; min-width: 0; }
 .compile-toggles { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
 .compile-toggles .btn.active { background: var(--primary); border-color: var(--primary); color: #fff; }
 .compile-split { display: flex; align-items: stretch; gap: 0; min-height: 60vh; }

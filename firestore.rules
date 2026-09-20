@@ -105,6 +105,13 @@ service cloud.firestore {
           && resource.data.state == 'draft');
     }
 
+    // ── Compile round drafts (shared, admin-only) ──────────────────
+    // The Compile view is admin-only, and its round drafts are a shared team
+    // artifact: any admin can read, edit, and delete them.
+    match /compileDrafts/{id} {
+      allow read, write: if isAdmin();
+    }
+
     // ── Sequential human-friendly ID counter ───────────────────────
     match /meta/{doc} {
       allow read, write: if isApproved();

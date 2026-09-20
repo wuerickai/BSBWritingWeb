@@ -83,6 +83,25 @@ export function confirmDialog(message, { confirmText = 'Confirm', danger = false
   });
 }
 
+// Single-line text prompt. Resolves to the trimmed string, or null if cancelled.
+export function promptDialog(message, { value = '', confirmText = 'Save', placeholder = '' } = {}) {
+  return new Promise((resolve) => {
+    const input = el('input', { class: 'inp', value, placeholder, style: 'width:100%' });
+    const done = (v) => { m.close(); resolve(v); };
+    const body = el('div', {}, [
+      el('p', { text: message, style: 'margin:0 0 12px' }),
+      input,
+      el('div', { class: 'row-end gap', style: 'margin-top:18px' }, [
+        el('button', { class: 'btn ghost', text: 'Cancel', onclick: () => done(null) }),
+        el('button', { class: 'btn primary', text: confirmText, onclick: () => done(input.value.trim() || null) }),
+      ]),
+    ]);
+    input.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); done(input.value.trim() || null); } });
+    const m = modal('', body);
+    requestAnimationFrame(() => { input.focus(); input.select(); });
+  });
+}
+
 export function fmtDate(ts) {
   if (!ts) return '—';
   const d = new Date(ts);
