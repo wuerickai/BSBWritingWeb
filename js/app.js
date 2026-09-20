@@ -2045,9 +2045,11 @@ async function migrateLegacyDrafts() {
 }
 
 // ── View: Compile a round ─────────────────────────────────────────────────────────
-// Admin-only. Pick finalized questions into a 23-pair round (4 per main subject +
-// 3 Energy) as Toss-ups / Bonuses, live-edit any finalized question, preview the
-// rendered round, then export LaTeX in the BSBcompile format. The three panels
+// Admin-only. Pick questions into a 23-pair round (4 per main subject +
+// 3 Energy) as Toss-ups / Bonuses, live-edit any question, preview the
+// rendered round, then export LaTeX in the BSBcompile format. The pool's status
+// dropdown draws from finalized questions (default), unfinalized ones still in
+// the pipeline, or all of them. The three panels
 // (Pool · Builder · Preview) can be resized by dragging the gutters or hidden.
 // Work happens inside a named draft; drafts are shared and backend-synced, and a
 // person can keep several open as tabs, each autosaving as they go.
@@ -2132,7 +2134,16 @@ function viewCompile() {
   };
 
   // ── Pool (left) ──
-  const filters = { subject: '', subcat: '', tub: '', difficulty: '', q: '' };
+  // `status` picks which questions the pool draws from: finalized (default),
+  // unfinalized (anything still in the pipeline), or all.
+  const filters = { status: 'finalized', subject: '', subcat: '', tub: '', difficulty: '', q: '' };
+  const statusSel = el('select', { class: 'inp sm' });
+  fillSelect(statusSel, [
+    { value: 'finalized', label: '★ Finalized' },
+    { value: 'unfinalized', label: 'Unfinalized' },
+    { value: 'all', label: 'All questions' },
+  ], { value: (x) => x.value, label: (x) => x.label, selected: 'finalized' });
+  statusSel.addEventListener('change', () => { filters.status = statusSel.value; drawPool(); });
   const subjectSel = el('select', { class: 'inp sm' });
   fillSelect(subjectSel, T.SUBJECTS, { placeholder: 'All subjects' });
   const subcatSel = el('select', { class: 'inp sm' });
@@ -2163,16 +2174,21 @@ function viewCompile() {
     redraw();
   };
 
+  const matchesStatus = (q) => filters.status === 'all'
+    || (filters.status === 'finalized' ? q.state === 'finalized' : q.state !== 'finalized');
+
   const drawPool = () => {
     const used = usedIds();
-    const rows = all.filter((q) => (!filters.subject || q.subject === filters.subject)
+    const rows = all.filter((q) => matchesStatus(q)
+      && (!filters.subject || q.subject === filters.subject)
       && (!filters.subcat || q.subcat === filters.subcat)
       && (!filters.tub || q.tub === filters.tub)
       && (!filters.difficulty || String(q.difficulty) === filters.difficulty)
       && (!filters.q || (q.questionText || '').toLowerCase().includes(filters.q.toLowerCase()) || (q.answerLine || '').toLowerCase().includes(filters.q.toLowerCase())));
-    poolCount.textContent = `${rows.length} finalized`;
+    const noun = filters.status === 'finalized' ? 'finalized' : filters.status === 'unfinalized' ? 'unfinalized' : 'question' + (rows.length === 1 ? '' : 's');
+    poolCount.textContent = `${rows.length} ${noun}`;
     clear(poolList);
-    if (!rows.length) { poolList.appendChild(el('p', { class: 'muted sm', style: 'padding:8px', text: 'No finalized questions match these filters.' })); return; }
+    if (!rows.length) { poolList.appendChild(el('p', { class: 'muted sm', style: 'padding:8px', text: `No ${filters.status === 'all' ? '' : filters.status + ' '}questions match these filters.` })); return; }
     for (const q of rows) {
       const inRound = used.has(q.id);
       poolList.appendChild(el('div', { class: 'compile-poolrow' + (inRound ? ' is-used' : '') }, [
@@ -2184,6 +2200,7 @@ function viewCompile() {
             el('span', { class: 'chip subtle', text: q.tub }),
             el('span', { class: 'chip subtle', text: q.type }),
             q.difficulty ? el('span', { class: 'chip subtle', text: 'D' + q.difficulty }) : null,
+            q.state !== 'finalized' ? el('span', { class: 'chip warn', title: 'Not finalized yet — ' + (STATE_META[q.state]?.label || q.state), text: 'not final' }) : null,
           ]),
           el('div', { class: 'compile-qtext', text: snippet(q.questionText) }),
         ]),
@@ -2270,6 +2287,7 @@ function viewCompile() {
         el('span', { class: 'chip subtle', text: '#' + q.humanId }),
         q.difficulty ? el('span', { class: 'chip subtle', text: 'D' + q.difficulty }) : null,
         mismatch ? el('span', { class: 'chip warn', title: `Written as ${q.tub}`, text: 'written ' + q.tub }) : null,
+        q.state !== 'finalized' ? el('span', { class: 'chip warn', title: 'Not finalized yet — ' + (STATE_META[q.state]?.label || q.state), text: 'not final' }) : null,
         el('span', { style: 'margin-left:auto; display:flex; gap:2px' }, [
           el('button', { class: 'icon-btn sm', text: '✎', title: 'Edit #' + q.humanId, onclick: () => openAdminEditor(q) }),
           el('button', { class: 'icon-btn sm', text: '✕', title: 'Remove', onclick: () => { slot[role] = null; redraw(); } }),
@@ -2572,8 +2590,8 @@ function viewCompile() {
   const saved = (() => { try { return JSON.parse(localStorage.getItem('sbq-compile-layout') || '{}'); } catch { return {}; } })();
   const panels = [
     { key: 'pool', grow: saved.pool?.grow ?? 1, hidden: saved.pool?.hidden ?? false, node: el('section', { class: 'compile-panel' }, [
-      el('div', { class: 'compile-col-head' }, [el('h3', { text: 'Finalized pool' }), poolCount]),
-      el('div', { class: 'filters wrap' }, [subjectSel, subcatSel, tubSel, diffSel, search]),
+      el('div', { class: 'compile-col-head' }, [el('h3', { text: 'Question pool' }), poolCount]),
+      el('div', { class: 'filters wrap' }, [statusSel, subjectSel, subcatSel, tubSel, diffSel, search]),
       poolList,
     ]) },
     { key: 'builder', grow: saved.builder?.grow ?? 1.25, hidden: saved.builder?.hidden ?? false, node: el('section', { class: 'compile-panel' }, [
@@ -2641,7 +2659,7 @@ function viewCompile() {
   host.appendChild(el('div', { class: 'page compile-page' }, [
     el('div', { class: 'page-head' }, [
       el('h1', { text: 'Compile a round' }),
-      el('p', { class: 'muted', text: 'Assign finalized questions into Toss-up / Bonus pairs, edit them live, preview the round, then export LaTeX. Work in a draft — keep several open as tabs; each autosaves. Drag the gutters to resize; use Panels to hide sections.' }),
+      el('p', { class: 'muted', text: 'Assign questions into Toss-up / Bonus pairs, edit them live, preview the round, then export LaTeX. Use the pool’s status dropdown to pull from finalized or still-unfinalized questions. Work in a draft — keep several open as tabs; each autosaves. Drag the gutters to resize; use Panels to hide sections.' }),
     ]),
     draftBar,
     toggleBar,
@@ -2652,12 +2670,14 @@ function viewCompile() {
   layout();
   applyComposition();
 
-  // Two live subscriptions: the finalized pool (so admin edits and (un)finalizing
-  // reflect immediately) and the shared set of round drafts.
+  // Two live subscriptions: the full question pool (so admin edits and
+  // (un)finalizing reflect immediately) and the shared set of round drafts.
   const unsubs = [];
   app.unsub = () => { for (const fn of unsubs) { try { fn(); } catch {} } };
 
-  unsubs.push(S().watchQuestions({ finalized: true }, (rows) => {
+  // Watch every non-archived question so the pool's status dropdown can draw from
+  // finalized or still-in-pipeline questions; drawPool() filters by filters.status.
+  unsubs.push(S().watchQuestions({}, (rows) => {
     all = rows;
     byId = new Map(rows.map((r) => [r.id, r]));
     byLoaded = true;
