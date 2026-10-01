@@ -298,6 +298,18 @@ export async function finalize(id, comment) {
   });
 }
 
+// Admin reversal of finalize: sends the question back into the review queue
+// (state in_review, status unchanged) and clears finalizedAt.
+export async function unfinalize(id, comment) {
+  const u = requireUser();
+  return mutate(id, (q) => {
+    if (q.state !== 'finalized') throw new Error('This question isn’t finalized.');
+    q.state = 'in_review';
+    q.finalizedAt = null;
+    q.history.push({ at: now(), byUid: u.uid, byName: u.displayName || u.email, action: 'unfinalized', comment: comment || '', statusAt: q.status });
+  });
+}
+
 export async function addComment(id, comment) {
   const u = requireUser();
   return mutate(id, (q) => {

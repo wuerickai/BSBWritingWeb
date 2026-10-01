@@ -834,7 +834,7 @@ function questionDetail(q) {
 }
 
 function historyTimeline(history) {
-  const labels = { submitted: 'Submitted for review', changes_requested: 'Changes requested', approved: 'Reviewed — looks good', finalized: 'Finalized', comment: 'Comment', suggestion: 'Suggested an edit', suggestion_accepted: 'Suggestion accepted', suggestion_rejected: 'Suggestion rejected', imported: 'Imported from spreadsheet', edited: 'Edited by admin', archived: 'Removed to graveyard', restored: 'Restored from graveyard' };
+  const labels = { submitted: 'Submitted for review', changes_requested: 'Changes requested', approved: 'Reviewed — looks good', finalized: 'Finalized', unfinalized: 'Unfinalized — back to review', comment: 'Comment', suggestion: 'Suggested an edit', suggestion_accepted: 'Suggestion accepted', suggestion_rejected: 'Suggestion rejected', imported: 'Imported from spreadsheet', edited: 'Edited by admin', archived: 'Removed to graveyard', restored: 'Restored from graveyard' };
   return el('ul', { class: 'timeline' }, history.slice().reverse().map((h) => el('li', { class: 'tl-item tl-' + h.action }, [
     el('div', { class: 'tl-head' }, [
       el('span', { class: 'tl-action', text: labels[h.action] || h.action }),
@@ -1037,6 +1037,29 @@ function archiveDialog(q, onDone) {
     } catch (e) { btn.disabled = false; toast(explainError(e), 'error'); }
   });
   const m = modal('Remove to graveyard', body);
+}
+
+// Admin-only: take a finalized question out of the finalized database and send
+// it back to the review queue. Captures an optional reason for the history log.
+function unfinalizeDialog(q, onDone) {
+  const reason = el('textarea', { class: 'inp', rows: 2, placeholder: 'Optional: why is this being unfinalized? (shown in its history)' });
+  const btn = el('button', { class: 'btn primary', text: 'Unfinalize' });
+  const body = el('div', {}, [
+    el('p', { style: 'margin:0 0 10px', text: `Unfinalize question #${q.humanId}? It leaves the finalized database and returns to the review queue (review count stays at ${q.status || 0}).` }),
+    reason,
+    el('div', { class: 'row-end gap', style: 'margin-top:14px' }, [
+      el('button', { class: 'btn ghost', text: 'Cancel', onclick: () => m.close() }),
+      btn,
+    ]),
+  ]);
+  btn.addEventListener('click', async () => {
+    btn.disabled = true;
+    try {
+      await S().unfinalize(q.id, reason.value.trim());
+      m.close(); toast('Unfinalized — back in the review queue.', 'success'); if (onDone) onDone();
+    } catch (e) { btn.disabled = false; toast(explainError(e), 'error'); }
+  });
+  const m = modal('Unfinalize question', body);
 }
 
 // ── View: Graveyard ────────────────────────────────────────────────────────────────
@@ -1598,6 +1621,7 @@ function renderTable(host, rows) {
       el('td', { class: 'nowrap-sm' }, [
         el('button', { class: 'btn ghost xs', text: 'View', onclick: () => modal(`Question #${q.humanId}`, questionDetail(q), { wide: true }) }),
         app.user.role === 'admin' ? el('button', { class: 'btn ghost xs', text: 'Edit', style: 'margin-left:6px', onclick: () => openAdminEditor(q) }) : null,
+        app.user.role === 'admin' ? el('button', { class: 'btn ghost xs', text: 'Unfinalize', style: 'margin-left:6px', title: 'Send back to the review queue', onclick: () => unfinalizeDialog(q) }) : null,
         app.user.role === 'admin' ? el('button', { class: 'btn danger xs', text: 'Remove', style: 'margin-left:6px', title: 'Move to the Graveyard (kept, not deleted)', onclick: () => archiveDialog(q) }) : null,
       ]),
     ]);

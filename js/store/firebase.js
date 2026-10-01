@@ -297,6 +297,15 @@ export async function finalize(id, comment) {
   await F.updateDoc(F.doc(db, 'questions', id), { state: 'finalized', finalizedAt: now(), history, updatedAt: now() });
 }
 
+// Admin reversal of finalize: sends the question back into the review queue
+// (state in_review, status unchanged) and clears finalizedAt.
+export async function unfinalize(id, comment) {
+  const u = requireUser();
+  const q = await getQ(id);
+  const history = (q.history || []).concat({ at: now(), byUid: u.uid, byName: u.displayName || u.email, action: 'unfinalized', comment: comment || '', statusAt: q.status });
+  await F.updateDoc(F.doc(db, 'questions', id), { state: 'in_review', finalizedAt: null, history, updatedAt: now() });
+}
+
 export async function addComment(id, comment) {
   const u = requireUser();
   const q = await getQ(id);
