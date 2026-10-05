@@ -2151,6 +2151,16 @@ function viewCompile() {
   const queueSave = debounce(flushSave, 700);
 
   const usedIds = () => new Set(slots.flatMap((s) => [s.tu?.id, s.b?.id].filter(Boolean)));
+  // A question may sit in only one round draft. Map every question placed in some
+  // OTHER draft (by its last-saved snapshot) → that draft's name.
+  const otherDraftUse = () => {
+    const m = new Map();
+    for (const d of drafts) {
+      if (d.id === activeId) continue;
+      for (const sl of d.slots || []) for (const id of [sl.tu, sl.b]) if (id && !m.has(id)) m.set(id, d.name || 'another draft');
+    }
+    return m;
+  };
 
   const snippet = (t, len = 120) => {
     const s = (t || '').replace(/\$[^$]*\$/g, '∎').replace(/\\[a-zA-Z]+\{([^}]*)\}/g, '$1');
@@ -2192,6 +2202,8 @@ function viewCompile() {
   // Assign a question to the first open slot of `role` whose subject matches.
   const assign = (q, role) => {
     if (usedIds().has(q.id)) { toast('That question is already in the round.', 'warn'); return; }
+    const elsewhere = otherDraftUse().get(q.id);
+    if (elsewhere) { toast(`That question is already used in draft “${elsewhere}”.`, 'warn'); return; }
     const slot = slots.find((s) => s.subject === q.subject && s[role] == null);
     if (!slot) { toast(`No open ${role === 'tu' ? 'Toss-up' : 'Bonus'} slot for ${q.subject}.`, 'warn'); return; }
     slot[role] = q;
@@ -2203,6 +2215,7 @@ function viewCompile() {
 
   const drawPool = () => {
     const used = usedIds();
+    const taken = otherDraftUse();
     const rows = all.filter((q) => matchesStatus(q)
       && (!filters.subject || q.subject === filters.subject)
       && (!filters.subcat || q.subcat === filters.subcat)
@@ -2215,7 +2228,8 @@ function viewCompile() {
     if (!rows.length) { poolList.appendChild(el('p', { class: 'muted sm', style: 'padding:8px', text: `No ${filters.status === 'all' ? '' : filters.status + ' '}questions match these filters.` })); return; }
     for (const q of rows) {
       const inRound = used.has(q.id);
-      poolList.appendChild(el('div', { class: 'compile-poolrow' + (inRound ? ' is-used' : '') }, [
+      const takenBy = inRound ? null : taken.get(q.id);
+      poolList.appendChild(el('div', { class: 'compile-poolrow' + (inRound || takenBy ? ' is-used' : '') }, [
         el('div', { class: 'compile-poolrow-main' }, [
           el('div', { class: 'compile-chips' }, [
             el('span', { class: 'chip subtle', text: '#' + q.humanId }),
@@ -2230,6 +2244,11 @@ function viewCompile() {
         ]),
         el('div', { class: 'compile-poolrow-actions' }, inRound
           ? [el('span', { class: 'chip', text: '✓ in round' })]
+          : takenBy
+          ? [
+              el('button', { class: 'btn ghost xs', text: 'View', onclick: () => modal(`Question #${q.humanId}`, questionDetail(q), { wide: true }) }),
+              el('span', { class: 'chip subtle', title: 'Already placed in round draft “' + takenBy + '”', text: 'in ' + takenBy }),
+            ]
           : [
               el('button', { class: 'btn ghost xs', text: 'View', onclick: () => modal(`Question #${q.humanId}`, questionDetail(q), { wide: true }) }),
               el('button', { class: 'btn ghost xs', text: '✎', title: 'Edit #' + q.humanId, onclick: () => openAdminEditor(q) }),
@@ -2300,6 +2319,7 @@ function viewCompile() {
       return node;
     }
     const mismatch = (role === 'tu' && q.tub !== 'TU') || (role === 'b' && q.tub !== 'B');
+    const alsoIn = otherDraftUse().get(q.id); // a clash from an older/concurrent edit
     node.setAttribute('draggable', 'true');
     node.title = 'Drag to re-pair (same subject)';
     node.addEventListener('dragstart', (e) => { dragSrc = { key: slot.key, role, subject: slot.subject }; node.classList.add('dragging'); e.dataTransfer.effectAllowed = 'move'; try { e.dataTransfer.setData('text/plain', slot.key + '|' + role); } catch {} });
@@ -2312,6 +2332,7 @@ function viewCompile() {
         q.difficulty ? el('span', { class: 'chip subtle', text: 'D' + q.difficulty }) : null,
         mismatch ? el('span', { class: 'chip warn', title: `Written as ${q.tub}`, text: 'written ' + q.tub }) : null,
         q.state !== 'finalized' ? el('span', { class: 'chip warn', title: 'Not finalized yet — ' + (STATE_META[q.state]?.label || q.state), text: 'not final' }) : null,
+        alsoIn ? el('span', { class: 'chip danger', title: 'Also placed in round draft “' + alsoIn + '” — remove it from one of them', text: 'also in ' + alsoIn }) : null,
         el('span', { style: 'margin-left:auto; display:flex; gap:2px' }, [
           el('button', { class: 'icon-btn sm', text: '✎', title: 'Edit #' + q.humanId, onclick: () => openAdminEditor(q) }),
           el('button', { class: 'icon-btn sm', text: '✕', title: 'Remove', onclick: () => { slot[role] = null; redraw(); } }),
@@ -2423,7 +2444,10 @@ function viewCompile() {
 
   const duplicateDraft = (id) => {
     const src = getDraft(id); if (!src) return;
-    openSavedDraft(newDraftState('Copy of ' + src.name, src), true);
+    // Questions can only live in one draft, so the copy keeps the composition and
+    // export options but starts with empty slots.
+    openSavedDraft(newDraftState('Copy of ' + src.name, { ...src, slots: [] }), true);
+    toast('Duplicated the layout — questions stay in the original draft.');
   };
 
   const renameDraft = async (id) => {
@@ -2530,7 +2554,7 @@ function viewCompile() {
     if (!openIds.includes(activeId)) activeId = openIds[0];
     saveUi();
     if (loadedWorkingId !== activeId) loadWorkingFromDraft(activeId);
-    else { drawDraftBar(); refreshManager?.(); }
+    else { drawDraftBar(); refreshManager?.(); drawPool(); drawRound(); } // other drafts' picks changed
   };
 
   // ── Preview (right) — rendered round in export order (build order) ──
@@ -2594,6 +2618,12 @@ function viewCompile() {
     const complete = slots.filter((s) => s.tu && s.b);
     const missing = slots.length - complete.length;
     if (!complete.length) { toast('Fill at least one full Toss-up + Bonus pair first.', 'warn'); return; }
+    const taken = otherDraftUse();
+    const clash = complete.flatMap((s) => [s.tu, s.b]).filter((q) => taken.has(q.id));
+    if (clash.length) {
+      toast(`Can’t compile: ${clash.map((q) => '#' + q.humanId + ' (in “' + taken.get(q.id) + '”)').join(', ')} ${clash.length === 1 ? 'is' : 'are'} also used in another draft.`, 'warn');
+      return;
+    }
     if (missing > 0) {
       const ok = await confirmDialog(`${missing} pair${missing === 1 ? ' is' : 's are'} incomplete and will be skipped. Compile the ${complete.length} complete pair${complete.length === 1 ? '' : 's'}?`, { confirmText: 'Compile' });
       if (!ok) return;
