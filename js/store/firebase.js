@@ -64,7 +64,15 @@ export async function init() {
   F = await import(`https://www.gstatic.com/firebasejs/${V}/firebase-firestore.js`);
   app = appMod.initializeApp(CONFIG.firebase);
   auth = A.getAuth(app);
-  db = F.getFirestore(app);
+  // Persist the cache in IndexedDB so a reload (or a second tab) resumes the
+  // all-questions listener with a resume token and is billed only for documents
+  // that changed, instead of re-reading the whole collection.
+  try {
+    db = F.initializeFirestore(app, { localCache: F.persistentLocalCache({ tabManager: F.persistentMultipleTabManager() }) });
+  } catch (e) {
+    console.warn('Firestore persistent cache unavailable; using memory cache', e);
+    db = F.getFirestore(app);
+  }
 
   A.onAuthStateChanged(auth, async (fbUser) => {
     if (!fbUser) { _user = null; emitAuth(); return; }
@@ -478,7 +486,17 @@ export function watchQuestions(filter, cb) {
   else if (filter.states) clauses.push(F.where('state', 'in', filter.states));
 
   const q = clauses.length ? F.query(col, ...clauses) : F.query(col);
-  return F.onSnapshot(q, (snap) => {
+  // With the persistent cache the first snapshot may be a stale copy from
+  // IndexedDB. Hold callbacks until the server has confirmed the result set so
+  // views (e.g. Compile hydrating draft slots by id) never act on missing docs.
+  // Metadata changes must be included, or the cache→server flip with no doc
+  // changes would never fire.
+  let synced = false;
+  return F.onSnapshot(q, { includeMetadataChanges: true }, (snap) => {
+    if (!synced) {
+      if (snap.metadata.fromCache) return;
+      synced = true;
+    } else if (!snap.docChanges().length) return; // metadata-only (e.g. pending write acked)
     let arr = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
     // Archived questions live only in the Graveyard. `archived` may be missing on
     // older docs, so filter client-side rather than with a where() clause.

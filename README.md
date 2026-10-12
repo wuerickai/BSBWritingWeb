@@ -99,7 +99,8 @@ Then: **Settings → Pages → Source: Deploy from a branch → `main` / root**.
 
 - While the app is open, all questions are snapshotted to this browser's IndexedDB every `backup.intervalMinutes` minutes (keeping the last `backup.keep`), and after each change.
 - **Admin → Backups** lists snapshots; you can **Download** any as JSON (off-device copy) or **Restore** one.
-- With the Firebase backend your data also lives server-side; the local snapshots are an extra safety net. For scheduled server-side exports, see Firestore's managed export/backup.
+- With the Firebase backend your data also lives server-side; the local snapshots are an extra safety net.
+- The Firebase backend also caches questions in IndexedDB (Firestore's persistent cache) so reloads only re-read changed documents. That cache stays in the browser after sign-out, so avoid using shared computers or clear site data afterwards. For scheduled server-side exports, see Firestore's managed export/backup.
 
 ## Accounts, roles & the review workflow
 

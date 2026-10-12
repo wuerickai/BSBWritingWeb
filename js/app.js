@@ -99,6 +99,7 @@ function startGlobal() {
   if (app.allUnsub) return;
   app.allUnsub = S().watchQuestions({ includeArchived: true }, (rows) => {
     app.allQuestions = rows;
+    app.allLoaded = true;
     Backup.markDirty();
     document.dispatchEvent(new CustomEvent('sbq-allquestions'));
   });
@@ -108,6 +109,29 @@ function stopGlobal() {
   if (app.allUnsub) { try { app.allUnsub(); } catch {} app.allUnsub = null; }
   Backup.stop(); _backupStarted = false;
   app.allQuestions = [];
+  app.allLoaded = false;
+}
+
+// Views filter the session-wide question list in memory instead of opening their
+// own Firestore listeners: every new listener re-reads its whole result set from
+// the server, so per-view listeners billed a full collection read on each route
+// change. Same filter semantics as store/firebase.js watchQuestions().
+function watchQuestions(filter, cb) {
+  const run = () => {
+    if (!app.allLoaded) return; // the global listener's first snapshot will call us
+    const u = app.user;
+    let arr = app.allQuestions;
+    if (filter.archived) arr = arr.filter((q) => q.archived === true);
+    else if (!filter.includeArchived) arr = arr.filter((q) => !q.archived);
+    if (filter.mine && u) arr = arr.filter((q) => q.writerUid === u.uid);
+    if (filter.excludeWriter && u && CONFIG.hideOwnQuestionsFromReviewer) arr = arr.filter((q) => q.writerUid !== u.uid);
+    if (filter.finalized) arr = arr.filter((q) => q.state === 'finalized');
+    else if (filter.states) arr = arr.filter((q) => filter.states.includes(q.state));
+    cb(arr.slice().sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0)));
+  };
+  document.addEventListener('sbq-allquestions', run);
+  run();
+  return () => document.removeEventListener('sbq-allquestions', run);
 }
 
 // ── Top-level render ───────────────────────────────────────────────────────────
@@ -126,7 +150,7 @@ let _pending = { at: 0, n: 0 };
 function invalidatePending() { _pending.at = 0; }
 async function updateAdminBadge(anchor) {
   try {
-    if (Date.now() - _pending.at > 8000) {
+    if (Date.now() - _pending.at > 120000) { // reads the whole users collection
       const us = await S().listUsers();
       _pending = { at: Date.now(), n: us.filter((u) => u.role === 'pending').length };
     }
@@ -1074,7 +1098,7 @@ function viewGraveyard() {
     listHost,
   ]));
 
-  app.unsub = S().watchQuestions({ archived: true }, (rows) => {
+  app.unsub = watchQuestions({ archived: true }, (rows) => {
     clear(listHost);
     if (!rows.length) { listHost.appendChild(emptyState('The Graveyard is empty. Removed questions will show up here.')); return; }
     for (const q of rows) listHost.appendChild(graveyardCard(q));
@@ -1129,7 +1153,7 @@ function viewMine() {
     listHost,
   ]));
 
-  app.unsub = S().watchQuestions({ mine: true }, (rows) => {
+  app.unsub = watchQuestions({ mine: true }, (rows) => {
     clear(listHost);
     if (!rows.length) { listHost.appendChild(emptyState('You haven’t written any questions yet.', 'Write your first one', () => navigate('write'))); return; }
     // Questions with something to resolve (changes requested or pending
@@ -1240,7 +1264,7 @@ function viewMineFinalize() {
     for (const q of current) listHost.appendChild(mineFinalizeCard(q));
   };
 
-  app.unsub = S().watchQuestions({ states: ['in_review'], mine: true }, (rows) => { all = rows; apply(); });
+  app.unsub = watchQuestions({ states: ['in_review'], mine: true }, (rows) => { all = rows; apply(); });
 }
 
 function mineFinalizeCard(q) {
@@ -1342,7 +1366,7 @@ function viewReview() {
     for (const q of current) listHost.appendChild(reviewCard(q));
   };
 
-  app.unsub = S().watchQuestions({ states: ['in_review'], excludeWriter: true }, (rows) => { all = rows; apply(); });
+  app.unsub = watchQuestions({ states: ['in_review'], excludeWriter: true }, (rows) => { all = rows; apply(); });
 }
 
 // ── Testsolve: try queue questions one at a time with answers hidden ──────────
@@ -1599,7 +1623,7 @@ function viewFinalized() {
     renderTable(tableHost, currentRows);
   };
 
-  app.unsub = S().watchQuestions({ finalized: true }, (rows) => { all = rows; apply(); });
+  app.unsub = watchQuestions({ finalized: true }, (rows) => { all = rows; apply(); });
 }
 
 function renderTable(host, rows) {
@@ -2731,7 +2755,7 @@ function viewCompile() {
 
   // Watch every non-archived question so the pool's status dropdown can draw from
   // finalized or still-in-pipeline questions; drawPool() filters by filters.status.
-  unsubs.push(S().watchQuestions({}, (rows) => {
+  unsubs.push(watchQuestions({}, (rows) => {
     all = rows;
     byId = new Map(rows.map((r) => [r.id, r]));
     byLoaded = true;
