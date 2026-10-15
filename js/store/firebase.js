@@ -432,24 +432,28 @@ export async function bulkUpsert(questions) {
 // the shared set; which draft tabs a person has open is per-device UI state kept
 // in the client's localStorage, not here. firestore.rules restricts this
 // collection to admins (the Compile view is admin-only).
-function draftShape(u, data) {
-  return {
-    name: data.name || 'Untitled draft',
-    composition: data.composition || [],
-    slots: data.slots || [],
-    roundNumber: data.roundNumber || '',
-    shuffle: data.shuffle !== false,
-    fullDoc: data.fullDoc !== false,
-    updatedAt: now(),
-    updatedByUid: u.uid,
-    updatedByName: u.displayName || u.email,
-  };
+// Only the fields present on `data` are written to an existing draft (setDoc
+// merges), so autosaving the working copy never clobbers a rename made elsewhere
+// and renaming never touches the contents. A new draft gets every field.
+const DRAFT_DEFAULTS = { name: 'Untitled draft', composition: [], slots: [], roundNumber: '' };
+function draftShape(u, data, isNew) {
+  const out = {};
+  for (const [k, dflt] of Object.entries(DRAFT_DEFAULTS)) {
+    if (isNew || data[k] !== undefined) out[k] = data[k] || dflt;
+  }
+  for (const k of ['shuffle', 'fullDoc']) {
+    if (isNew || data[k] !== undefined) out[k] = data[k] !== false;
+  }
+  out.updatedAt = now();
+  out.updatedByUid = u.uid;
+  out.updatedByName = u.displayName || u.email;
+  return out;
 }
 
 export async function saveCompileDraft(draft) {
   const u = requireUser();
   const { id } = draft;
-  const data = draftShape(u, draft);
+  const data = draftShape(u, draft, !id);
   if (id) {
     await F.setDoc(F.doc(db, 'compileDrafts', id), data, { merge: true });
     return { id, ...data };
@@ -466,7 +470,15 @@ export async function deleteCompileDraft(id) {
 }
 
 export function watchCompileDrafts(cb) {
-  return F.onSnapshot(F.query(F.collection(db, 'compileDrafts')), (snap) => {
+  // Like watchQuestions: skip stale IndexedDB snapshots until the server confirms,
+  // or Compile would load an old copy of the active draft (and autosave it back
+  // over newer edits) or, on an empty cache, seed a spurious "Draft 1".
+  let synced = false;
+  return F.onSnapshot(F.query(F.collection(db, 'compileDrafts')), { includeMetadataChanges: true }, (snap) => {
+    if (!synced) {
+      if (snap.metadata.fromCache) return;
+      synced = true;
+    } else if (!snap.docChanges().length) return; // metadata-only (e.g. pending write acked)
     const arr = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
     arr.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
     cb(arr);

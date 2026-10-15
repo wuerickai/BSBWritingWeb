@@ -429,17 +429,14 @@ export async function saveCompileDraft(draft) {
   const u = requireUser();
   const arr = read(K_COMPILE, []);
   const existing = draft.id ? arr.find((d) => d.id === draft.id) : null;
-  const data = {
-    name: draft.name || 'Untitled draft',
-    composition: draft.composition || [],
-    slots: draft.slots || [],
-    roundNumber: draft.roundNumber || '',
-    shuffle: draft.shuffle !== false,
-    fullDoc: draft.fullDoc !== false,
-    updatedAt: now(),
-    updatedByUid: u.uid,
-    updatedByName: u.displayName || u.email,
-  };
+  // As in firebase: an update writes only the fields given; a new draft gets all.
+  const isNew = !existing;
+  const data = {};
+  for (const [k, dflt] of Object.entries({ name: 'Untitled draft', composition: [], slots: [], roundNumber: '' })) {
+    if (isNew || draft[k] !== undefined) data[k] = draft[k] || dflt;
+  }
+  for (const k of ['shuffle', 'fullDoc']) if (isNew || draft[k] !== undefined) data[k] = draft[k] !== false;
+  Object.assign(data, { updatedAt: now(), updatedByUid: u.uid, updatedByName: u.displayName || u.email });
   let rec;
   if (existing) { Object.assign(existing, data); rec = existing; }
   else {

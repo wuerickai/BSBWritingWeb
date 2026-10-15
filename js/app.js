@@ -2109,6 +2109,7 @@ function viewCompile() {
   // The shared draft list arrives live from the backend; open tabs / active draft
   // are per-device UI state in localStorage.
   let drafts = [];        // shared drafts from the backend (last-saved snapshots)
+  let draftsLoaded = false; // the clash check needs the other drafts, so picks wait for them
   let creatingSeed = false; // guards the "no drafts yet → make one" bootstrap
   const ui = (() => { try { return JSON.parse(localStorage.getItem(COMPILE_UI_KEY) || 'null') || {}; } catch { return {}; } })();
   let openIds = Array.isArray(ui.openIds) ? ui.openIds.slice() : [];
@@ -2156,12 +2157,13 @@ function viewCompile() {
   };
 
   // Push the working copy to the backend under the active draft (debounced).
+  // The name is deliberately left out: renames are saved on their own, so an
+  // autosave from a stale snapshot can't write an old name back.
   const flushSave = async () => {
     if (!activeId || loadedWorkingId !== activeId || pendingHydrate) return;
     try {
       const saved = await S().saveCompileDraft({
         id: activeId,
-        name: getDraft(activeId)?.name || 'Untitled draft',
         composition: composition.map((c) => ({ subject: c.subject, pairs: c.pairs })),
         slots: slots.map((s) => ({ subject: s.subject, tu: s.tu?.id || null, b: s.b?.id || null })),
         roundNumber: titleInp.value.trim(),
@@ -2175,15 +2177,40 @@ function viewCompile() {
   const queueSave = debounce(flushSave, 700);
 
   const usedIds = () => new Set(slots.flatMap((s) => [s.tu?.id, s.b?.id].filter(Boolean)));
+  // Ids placed more than once in this round (only possible via older drafts or
+  // concurrent edits — assign() refuses it).
+  const dupeIds = () => {
+    const seen = new Set(), dup = new Set();
+    for (const s of slots) for (const q of [s.tu, s.b]) if (q) (seen.has(q.id) ? dup : seen).add(q.id);
+    return dup;
+  };
   // A question may sit in only one round draft. Map every question placed in some
-  // OTHER draft (by its last-saved snapshot) → that draft's name.
+  // OTHER draft (by its last-saved snapshot) → that draft's name(s).
   const otherDraftUse = () => {
     const m = new Map();
     for (const d of drafts) {
       if (d.id === activeId) continue;
-      for (const sl of d.slots || []) for (const id of [sl.tu, sl.b]) if (id && !m.has(id)) m.set(id, d.name || 'another draft');
+      const name = d.name || 'another draft';
+      for (const sl of d.slots || []) for (const id of [sl.tu, sl.b]) {
+        if (!id) continue;
+        const prev = m.get(id);
+        if (!prev) m.set(id, name);
+        else if (!prev.split(', ').includes(name)) m.set(id, prev + ', ' + name);
+      }
     }
     return m;
+  };
+  // Per draft: how many of its questions also sit in another draft (or twice in it).
+  const draftClashCounts = () => {
+    const owners = new Map(); // id → Set of draft ids
+    const counts = new Map();
+    for (const d of drafts) for (const sl of d.slots || []) for (const id of [sl.tu, sl.b]) {
+      if (!id) continue;
+      if (!owners.has(id)) owners.set(id, []);
+      owners.get(id).push(d.id);
+    }
+    for (const ds of owners.values()) if (ds.length > 1) for (const did of new Set(ds)) counts.set(did, (counts.get(did) || 0) + 1);
+    return counts;
   };
 
   const snippet = (t, len = 120) => {
@@ -2225,6 +2252,7 @@ function viewCompile() {
 
   // Assign a question to the first open slot of `role` whose subject matches.
   const assign = (q, role) => {
+    if (!draftsLoaded || loadedWorkingId !== activeId) { toast('Still loading round drafts — try again in a moment.', 'warn'); return; }
     if (usedIds().has(q.id)) { toast('That question is already in the round.', 'warn'); return; }
     const elsewhere = otherDraftUse().get(q.id);
     if (elsewhere) { toast(`That question is already used in draft “${elsewhere}”.`, 'warn'); return; }
@@ -2252,7 +2280,7 @@ function viewCompile() {
     if (!rows.length) { poolList.appendChild(el('p', { class: 'muted sm', style: 'padding:8px', text: `No ${filters.status === 'all' ? '' : filters.status + ' '}questions match these filters.` })); return; }
     for (const q of rows) {
       const inRound = used.has(q.id);
-      const takenBy = inRound ? null : taken.get(q.id);
+      const takenBy = taken.get(q.id);
       poolList.appendChild(el('div', { class: 'compile-poolrow' + (inRound || takenBy ? ' is-used' : '') }, [
         el('div', { class: 'compile-poolrow-main' }, [
           el('div', { class: 'compile-chips' }, [
@@ -2267,7 +2295,10 @@ function viewCompile() {
           el('div', { class: 'compile-qtext', text: snippet(q.questionText) }),
         ]),
         el('div', { class: 'compile-poolrow-actions' }, inRound
-          ? [el('span', { class: 'chip', text: '✓ in round' })]
+          ? [
+              el('span', { class: 'chip', text: '✓ in round' }),
+              takenBy ? el('span', { class: 'chip danger', title: 'Also placed in round draft “' + takenBy + '” — remove it from one of them', text: 'also in ' + takenBy }) : null,
+            ]
           : takenBy
           ? [
               el('button', { class: 'btn ghost xs', text: 'View', onclick: () => modal(`Question #${q.humanId}`, questionDetail(q), { wide: true }) }),
@@ -2344,6 +2375,7 @@ function viewCompile() {
     }
     const mismatch = (role === 'tu' && q.tub !== 'TU') || (role === 'b' && q.tub !== 'B');
     const alsoIn = otherDraftUse().get(q.id); // a clash from an older/concurrent edit
+    const twice = dupeIds().has(q.id);
     node.setAttribute('draggable', 'true');
     node.title = 'Drag to re-pair (same subject)';
     node.addEventListener('dragstart', (e) => { dragSrc = { key: slot.key, role, subject: slot.subject }; node.classList.add('dragging'); e.dataTransfer.effectAllowed = 'move'; try { e.dataTransfer.setData('text/plain', slot.key + '|' + role); } catch {} });
@@ -2356,6 +2388,7 @@ function viewCompile() {
         q.difficulty ? el('span', { class: 'chip subtle', text: 'D' + q.difficulty }) : null,
         mismatch ? el('span', { class: 'chip warn', title: `Written as ${q.tub}`, text: 'written ' + q.tub }) : null,
         q.state !== 'finalized' ? el('span', { class: 'chip warn', title: 'Not finalized yet — ' + (STATE_META[q.state]?.label || q.state), text: 'not final' }) : null,
+        twice ? el('span', { class: 'chip danger', title: 'This question is placed more than once in this round — remove the extra', text: 'twice in round' }) : null,
         alsoIn ? el('span', { class: 'chip danger', title: 'Also placed in round draft “' + alsoIn + '” — remove it from one of them', text: 'also in ' + alsoIn }) : null,
         el('span', { style: 'margin-left:auto; display:flex; gap:2px' }, [
           el('button', { class: 'icon-btn sm', text: '✎', title: 'Edit #' + q.humanId, onclick: () => openAdminEditor(q) }),
@@ -2479,11 +2512,10 @@ function viewCompile() {
     const name = await promptDialog('Rename draft', { value: d.name });
     if (!name) return;
     d.name = name; // optimistic; the watch will confirm
-    drawDraftBar(); refreshManager?.();
-    try {
-      if (id === activeId) await flushSave(); // saves the new name with the working copy
-      else await S().saveCompileDraft({ id, name, composition: d.composition, slots: d.slots, roundNumber: d.roundNumber, shuffle: d.shuffle, fullDoc: d.fullDoc });
-    } catch (e) { console.error('rename draft', e); toast('Couldn’t rename the draft.', 'warn'); }
+    drawDraftBar(); refreshManager?.(); drawPool(); drawRound(); // "in <name>" chips
+    // Writes only the name, so it never depends on (or clobbers) the working copy.
+    try { await S().saveCompileDraft({ id, name }); }
+    catch (e) { console.error('rename draft', e); toast('Couldn’t rename the draft.', 'warn'); }
   };
 
   const closeDraftTab = (id) => {
@@ -2519,6 +2551,7 @@ function viewCompile() {
       clear(listHost);
       if (!drafts.length) { listHost.appendChild(el('p', { class: 'muted sm', text: 'No drafts yet.' })); return; }
       const sorted = [...drafts].sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+      const clashes = draftClashCounts();
       for (const d of sorted) {
         const isOpen = openIds.includes(d.id);
         const isActive = d.id === activeId;
@@ -2528,6 +2561,7 @@ function viewCompile() {
           el('div', { class: 'grow' }, [
             el('strong', { text: d.name }),
             isActive ? el('span', { class: 'chip', style: 'margin-left:8px', text: 'active' }) : (isOpen ? el('span', { class: 'chip subtle', style: 'margin-left:8px', text: 'open' }) : null),
+            clashes.get(d.id) ? el('span', { class: 'chip danger', style: 'margin-left:8px', title: 'Questions also placed in another draft (or twice in this one)', text: `${clashes.get(d.id)} duplicate${clashes.get(d.id) === 1 ? '' : 's'}` }) : null,
             el('div', { class: 'muted sm', text: `Round ${d.roundNumber || '—'} · ${filled} question${filled === 1 ? '' : 's'} placed · updated ${fmtDate(d.updatedAt)}${by}` }),
           ]),
           el('div', { class: 'row-end gap' }, [
@@ -2552,7 +2586,9 @@ function viewCompile() {
       const d = getDraft(id); if (!d) continue;
       const isActive = id === activeId;
       tabs.appendChild(el('div', { class: 'draft-tab' + (isActive ? ' active' : '') }, [
-        el('button', { class: 'draft-tab-name', text: d.name, title: 'Updated ' + fmtDate(d.updatedAt) + ' · double-click to rename', onclick: () => loadDraft(id), ondblclick: () => renameDraft(id) }),
+        // The first click of a double-click switches tabs and rebuilds this bar, so
+        // `dblclick` never reaches the new button; read the click count instead.
+        el('button', { class: 'draft-tab-name', text: d.name, title: 'Updated ' + fmtDate(d.updatedAt) + ' · double-click to rename', onclick: (e) => (e.detail === 2 ? renameDraft(id) : loadDraft(id)) }),
         el('button', { class: 'draft-tab-x', text: '✕', title: 'Close tab (the draft is kept)', onclick: (e) => { e.stopPropagation(); closeDraftTab(id); } }),
       ]));
     }
@@ -2565,6 +2601,7 @@ function viewCompile() {
   // working copy intact unless the active draft changed or vanished.
   const applyDraftsSnapshot = async (rows) => {
     drafts = rows;
+    draftsLoaded = true;
     if (!rows.length) {
       if (creatingSeed) return;
       creatingSeed = true;
@@ -2642,6 +2679,12 @@ function viewCompile() {
     const complete = slots.filter((s) => s.tu && s.b);
     const missing = slots.length - complete.length;
     if (!complete.length) { toast('Fill at least one full Toss-up + Bonus pair first.', 'warn'); return; }
+    const dup = dupeIds();
+    if (dup.size) {
+      const ids = [...dup].map((id) => '#' + (byId.get(id)?.humanId ?? '?')).join(', ');
+      toast(`Can’t compile: ${ids} ${dup.size === 1 ? 'is' : 'are'} placed more than once in this round.`, 'warn');
+      return;
+    }
     const taken = otherDraftUse();
     const clash = complete.flatMap((s) => [s.tu, s.b]).filter((q) => taken.has(q.id));
     if (clash.length) {
