@@ -363,6 +363,7 @@ input[type=file].inp { padding: 8px; font-size: .85rem; }
 .compile-comp-item { display: flex; align-items: center; gap: 6px; }
 .compile-col-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; margin-bottom: 10px; }
 .compile-col-head h3 { margin: 0; }
+.compile-export-btns { display: flex; flex-direction: column; align-items: stretch; gap: 6px; }
 .compile-pool { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; }
 .compile-poolrow { display: flex; gap: 10px; justify-content: space-between; align-items: flex-start; padding: 10px; border: 1px solid var(--line); border-radius: var(--radius-sm); background: var(--bg-2); }
 .compile-poolrow.is-used { opacity: .5; }

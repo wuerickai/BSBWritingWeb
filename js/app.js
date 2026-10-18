@@ -2041,6 +2041,96 @@ function interleaveShuffle(pairs) {
   return out;
 }
 
+// ── Round compilation → MoSS packet JSON ─────────────────────────────────────────
+// MoSS (scibowl-org/apps/moss) reads { packet, year, questions[] } and renders
+// only $…$ math (KaTeX, no mhchem), \textbf{…}, and text-mode _{…}/^{…}. Our
+// writer macros are rewritten into that subset so they display instead of
+// showing raw backslashes.
+const MOSS_CATEGORY = {
+  'Biology': 'BIOLOGY', 'Chemistry': 'CHEMISTRY', 'Earth and Space': 'EARTH_SPACE',
+  'Energy': 'ENERGY', 'Math': 'MATH', 'Physics': 'PHYSICS',
+};
+
+// Index just past the "}" matching the "{" at src[open].
+function closeBrace(src, open) {
+  let depth = 0;
+  for (let j = open; j < src.length; j++) {
+    if (src[j] === '\\') { j++; continue; }
+    if (src[j] === '{') depth++;
+    else if (src[j] === '}' && --depth === 0) return j + 1;
+  }
+  return src.length;
+}
+
+// Best-effort \ce{…} → subscripts/superscripts MoSS understands (H2SO4 → H_{2}SO_{4}).
+function ceToScripts(s) {
+  return s
+    .replace(/([A-Za-z)\]])(\d+)/g, '$1_{$2}')
+    .replace(/\^(\d*[+-])/g, '^{$1}')
+    .replace(/<=>/g, '⇌').replace(/->/g, '→');
+}
+
+function mossText(src, inMath = false) {
+  if (!src) return '';
+  let out = '';
+  let i = 0;
+  while (i < src.length) {
+    const c = src[i];
+    if (c === '$' && !inMath) {
+      const end = src.indexOf('$', i + 1);
+      if (end === -1) { out += src.slice(i); break; }
+      out += '$' + mossText(src.slice(i + 1, end), true) + '$';
+      i = end + 1; continue;
+    }
+    if (c === '\\') {
+      const m = /^\\([a-zA-Z]+)\s*/.exec(src.slice(i));
+      if (m && src[i + m[0].length] === '{') {
+        const open = i + m[0].length;
+        const end = closeBrace(src, open);
+        const arg = src.slice(open + 1, end - 1);
+        let rep = null;
+        switch (m[1]) {
+          case 'ce': case 'pu':
+            rep = inMath ? '\\mathrm{' + ceToScripts(arg) + '}' : ceToScripts(arg); break;
+          case 'pron': rep = inMath ? null : '\\textbf{[' + arg + ']}'; break;
+          case 'readas': rep = inMath ? null : '(read: ' + mossText(arg) + ')'; break;
+          case 'readernote': rep = inMath ? null : '(' + mossText(arg) + ')'; break;
+          case 'textit': case 'emph': rep = inMath ? null : mossText(arg); break;
+          case 'textbf': rep = inMath ? null : '\\textbf{' + mossText(arg) + '}'; break;
+        }
+        if (rep != null) { out += rep; i = end; continue; }
+      }
+      out += src.slice(i, i + 2); i += 2; continue;
+    }
+    out += c; i++;
+  }
+  return out;
+}
+
+function questionToMoss(q, id, pairId, questionType, source) {
+  const mc = q.type === 'MC';
+  return {
+    id,
+    pair_id: pairId,
+    question_type: questionType,
+    question_style: mc ? 'MULTIPLE_CHOICE' : 'SHORT_ANSWER',
+    category: MOSS_CATEGORY[q.subject] || String(q.subject || '').toUpperCase().replace(/\W+/g, '_'),
+    question_text: mossText((q.questionText || '').trim()),
+    options: mc ? T.MC_SLOTS.map((s) => mossText((q.choices?.[s] ?? '').trim())) : [],
+    correct_answer: mc ? (q.mcAnswer || '') : mossText(allCapsPreservingLatex((q.answerLine || '').trim())),
+    source,
+  };
+}
+
+function buildRoundMoss(pairs, { packet, source, year = new Date().getFullYear() }) {
+  const questions = [];
+  pairs.forEach((pair, i) => {
+    questions.push(questionToMoss(pair.tu, questions.length + 1, i + 1, 'TOSSUP', source));
+    questions.push(questionToMoss(pair.b, questions.length + 1, i + 1, 'BONUS', source));
+  });
+  return { packet, year, questions };
+}
+
 // ── Compile drafts (localStorage) ─────────────────────────────────────────────────
 // A round draft records its composition, the question id sitting in every slot,
 // the round number, and the export options. Drafts are SHARED across admins and
@@ -2675,32 +2765,63 @@ function viewCompile() {
   shuffleChk.addEventListener('change', queueSave);
   fullDocChk.addEventListener('change', queueSave);
 
-  const compile = async () => {
+  // The last shuffled export order, reused while the round's pairs are unchanged
+  // so the LaTeX and JSON exports of the same round come out in the same order.
+  let lastOrder = null;
+  const pairKey = (s) => s.tu.id + '|' + s.b.id;
+  const orderPairs = (complete) => {
+    if (!shuffleChk.checked) return complete;
+    const keys = complete.map(pairKey);
+    if (lastOrder && lastOrder.length === keys.length && keys.every((k) => lastOrder.includes(k))) {
+      const byKey = new Map(complete.map((s) => [pairKey(s), s]));
+      return lastOrder.map((k) => byKey.get(k));
+    }
+    const ordered = interleaveShuffle(complete);
+    lastOrder = ordered.map(pairKey);
+    return ordered;
+  };
+
+  // Shared checks for every export; resolves to the ordered complete pairs, or null.
+  const exportPairs = async () => {
     const complete = slots.filter((s) => s.tu && s.b);
     const missing = slots.length - complete.length;
-    if (!complete.length) { toast('Fill at least one full Toss-up + Bonus pair first.', 'warn'); return; }
+    if (!complete.length) { toast('Fill at least one full Toss-up + Bonus pair first.', 'warn'); return null; }
     const dup = dupeIds();
     if (dup.size) {
       const ids = [...dup].map((id) => '#' + (byId.get(id)?.humanId ?? '?')).join(', ');
       toast(`Can’t compile: ${ids} ${dup.size === 1 ? 'is' : 'are'} placed more than once in this round.`, 'warn');
-      return;
+      return null;
     }
     const taken = otherDraftUse();
     const clash = complete.flatMap((s) => [s.tu, s.b]).filter((q) => taken.has(q.id));
     if (clash.length) {
       toast(`Can’t compile: ${clash.map((q) => '#' + q.humanId + ' (in “' + taken.get(q.id) + '”)').join(', ')} ${clash.length === 1 ? 'is' : 'are'} also used in another draft.`, 'warn');
-      return;
+      return null;
     }
     if (missing > 0) {
       const ok = await confirmDialog(`${missing} pair${missing === 1 ? ' is' : 's are'} incomplete and will be skipped. Compile the ${complete.length} complete pair${complete.length === 1 ? '' : 's'}?`, { confirmText: 'Compile' });
-      if (!ok) return;
+      if (!ok) return null;
     }
-    const ordered = shuffleChk.checked ? interleaveShuffle(complete) : complete;
+    return orderPairs(complete);
+  };
+
+  const compile = async () => {
+    const ordered = await exportPairs();
+    if (!ordered) return;
     const round = titleInp.value.trim();
     const tex = buildRoundTex(ordered, { roundNumber: round, fullDocument: fullDocChk.checked });
     showTexModal(tex, round ? 'Round ' + round : 'Round');
   };
+  const compileJson = async () => {
+    const ordered = await exportPairs();
+    if (!ordered) return;
+    const round = titleInp.value.trim();
+    const draftName = getDraft(activeId)?.name || 'Round';
+    const packet = buildRoundMoss(ordered, { packet: round ? 'Round ' + round : 'Round', source: draftName });
+    showJsonModal(JSON.stringify(packet, null, 2), draftName);
+  };
   const compileBtn = el('button', { class: 'btn primary sm', text: '📄 Compile LaTeX', onclick: compile });
+  const compileJsonBtn = el('button', { class: 'btn ghost sm', text: '{ } Compile JSON', title: 'Export this round as a MoSS packet (.json)', onclick: compileJson });
   const resetBtn = el('button', { class: 'btn ghost sm', text: 'Clear', onclick: async () => {
     if (slots.some((s) => s.tu || s.b) && !(await confirmDialog('Clear all assigned questions from this round?', { danger: true, confirmText: 'Clear' }))) return;
     buildSlots(false); redraw();
@@ -2721,7 +2842,7 @@ function viewCompile() {
       roundHost,
     ]) },
     { key: 'preview', grow: saved.preview?.grow ?? 1.1, hidden: saved.preview?.hidden ?? false, node: el('section', { class: 'compile-panel' }, [
-      el('div', { class: 'compile-col-head' }, [el('h3', { text: 'Preview' }), compileBtn]),
+      el('div', { class: 'compile-col-head' }, [el('h3', { text: 'Preview' }), el('div', { class: 'compile-export-btns' }, [compileBtn, compileJsonBtn])]),
       el('div', { class: 'compile-options' }, [
         field('Round #', titleInp),
         el('label', { class: 'compile-check' }, [shuffleChk, el('span', { class: 'sm', text: 'Shuffle on export' })]),
@@ -2838,6 +2959,26 @@ function showTexModal(tex, title) {
     ]),
   ]);
   modal('Compiled round — LaTeX', body, { wide: true });
+}
+
+function showJsonModal(json, title) {
+  const ta = el('textarea', { class: 'inp', style: 'width:100%;min-height:340px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.82rem;white-space:pre' });
+  ta.value = json;
+  const body = el('div', {}, [
+    el('p', { class: 'muted sm', style: 'margin:0 0 10px', text: 'MoSS packet format. Copy the JSON below or download it as a .json file.' }),
+    ta,
+    el('div', { class: 'row-end gap', style: 'margin-top:14px' }, [
+      el('button', { class: 'btn ghost', text: 'Copy', onclick: async () => {
+        try { await navigator.clipboard.writeText(json); toast('Copied JSON to clipboard.', 'success'); }
+        catch { ta.select(); document.execCommand('copy'); toast('Copied.', 'success'); }
+      } }),
+      el('button', { class: 'btn primary', text: '⬇ Download .json', onclick: () => {
+        const name = (title || 'round').replace(/[^a-z0-9._-]+/gi, '_') + '.json';
+        triggerDownload(new Blob([json], { type: 'application/json' }), name);
+      } }),
+    ]),
+  ]);
+  modal('Compiled round — MoSS JSON', body, { wide: true });
 }
 
 // ── View: Admin (sub-tabs: Users / Import / Backups) ─────────────────────────────
