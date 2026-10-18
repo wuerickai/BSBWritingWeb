@@ -1345,11 +1345,15 @@ function viewReview() {
     class: 'btn ghost', text: '🎯 Testsolve', title: 'Try these questions with the answers hidden',
     onclick: () => openTestsolve(current),
   });
+  const exportCsvBtn = el('button', {
+    class: 'btn ghost', text: '⬇ CSV', title: 'Download the questions shown (with the current filters) as CSV',
+    onclick: () => downloadCsv(current, 'review-queue.csv'),
+  });
 
   host.appendChild(el('div', { class: 'page' }, [
     el('div', { class: 'page-head row-between' }, [
       el('div', {}, [el('h1', { text: 'Review queue' }), el('p', { class: 'muted', text: 'Questions submitted by others. Add suggestions and send back, sign off if it looks good, or approve to finalize.' })]),
-      testsolveBtn,
+      el('div', { class: 'row-end gap' }, [exportCsvBtn, testsolveBtn]),
     ]),
     controls, listHost,
   ]));
@@ -1361,6 +1365,7 @@ function viewReview() {
       && (!filters.difficulty || String(q.difficulty) === filters.difficulty));
     current.sort(sorters[filters.sort]);
     testsolveBtn.disabled = current.length === 0;
+    exportCsvBtn.disabled = current.length === 0;
     clear(listHost);
     if (!current.length) { listHost.appendChild(emptyState('Nothing to review right now. 🎉')); return; }
     for (const q of current) listHost.appendChild(reviewCard(q));
@@ -1658,7 +1663,7 @@ function csvEscape(v) {
   const s = v == null ? '' : String(v);
   return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
 }
-function downloadCsv(rows) {
+function downloadCsv(rows, filename = 'finalized-questions.csv') {
   const headers = ['TU/B', 'Subject', 'Type', 'Subcat', 'Question Text', 'IF SA - Answer Line', 'W', 'X', 'Y', 'Z', 'IF MC - Answer', 'IF MC - Answer Text', 'Difficulty', 'Status', 'ID', 'Source', 'Writer Initials'];
   const lines = [headers.join(',')];
   for (const q of rows) {
@@ -1668,7 +1673,7 @@ function downloadCsv(rows) {
       ? (q.mcAnswerText || allCapsPreservingLatex(q.choices?.[q.mcAnswer] || '')) : '';
     lines.push([q.tub, q.subject, q.type, q.subcat, q.questionText, q.type === 'SA' ? q.answerLine : '', q.choices?.W, q.choices?.X, q.choices?.Y, q.choices?.Z, q.type === 'MC' ? q.mcAnswer : '', mcAnswerText, q.difficulty, q.status, q.humanId, q.source, q.writerInitials].map(csvEscape).join(','));
   }
-  triggerDownload(new Blob([lines.join('\n')], { type: 'text/csv' }), 'finalized-questions.csv');
+  triggerDownload(new Blob([lines.join('\n')], { type: 'text/csv' }), filename);
 }
 function downloadJson(rows) {
   triggerDownload(new Blob([JSON.stringify(rows, null, 2)], { type: 'application/json' }), 'finalized-questions.json');
