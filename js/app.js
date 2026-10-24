@@ -181,7 +181,8 @@ function renderHeader() {
       ['stats', '𝛴 Statistics'],
       ['graveyard', '🪦 Graveyard'],
     );
-    if (app.user.role === 'admin') tabs.push(['compile', '📄 Compile'], ['admin', '⚙ Admin']);
+    tabs.push(['compile', '📄 Compile']);
+    if (app.user.role === 'admin') tabs.push(['admin', '⚙ Admin']);
     const nav = el('nav', { class: 'tabs' });
     const cur = currentRoute();
     let adminAnchor = null;
@@ -389,7 +390,7 @@ function routeTo(route) {
     case 'finalized': return viewFinalized();
     case 'stats': return viewStats();
     case 'graveyard': return viewGraveyard();
-    case 'compile': return app.user.role === 'admin' ? viewCompile() : viewWrite();
+    case 'compile': return viewCompile();
     case 'admin': return app.user.role === 'admin' ? viewAdmin() : viewWrite();
     default: return viewWrite();
   }
@@ -2138,7 +2139,7 @@ function buildRoundMoss(pairs, { packet, source, year = new Date().getFullYear()
 
 // ── Compile drafts (localStorage) ─────────────────────────────────────────────────
 // A round draft records its composition, the question id sitting in every slot,
-// the round number, and the export options. Drafts are SHARED across admins and
+// the round number, and the export options. Drafts are SHARED with all members and
 // persisted to the backend (Firestore in firebase mode); slot ids are re-hydrated
 // to live question objects when a draft is opened. Which tabs a person has open is
 // per-device UI state kept in localStorage (see UI_KEY below), not synced.
@@ -2187,8 +2188,95 @@ async function migrateLegacyDrafts() {
   return toCreate.length > 0;
 }
 
+// ── Compile: editing and reviewing questions in place ─────────────────────────────
+// Everyone can work in the Compile view, but question permissions don't change:
+// admins edit any question directly, authors edit their own (until finalized),
+// and everyone else reviews / suggests edits through the normal review flow.
+function canEditDirectly(q) {
+  if (app.user.role === 'admin') return true;
+  return q.writerUid === app.user.uid && q.state !== 'finalized';
+}
+
+function editFromCompile(q) {
+  if (app.user.role === 'admin') return openAdminEditor(q);
+  if (q.writerUid === app.user.uid && q.state !== 'finalized') return openEditor(q);
+  return reviewFromCompile(q);
+}
+
+function reviewFromCompile(q) {
+  if (q.writerUid === app.user.uid) return openMyQuestion(q);
+  if (q.state === 'in_review') return openReview(q);
+  // Not in the review queue (a draft, sent back, or finalized): show it with its
+  // pending suggestions, and let people suggest an edit unless it's finalized.
+  const live = el('div', {});
+  const stop = S().watchOne(q.id, (cur) => {
+    clear(live);
+    if (!cur) { live.appendChild(el('p', { text: 'This question is no longer available.' })); return; }
+    live.appendChild(questionDetail(cur));
+    live.appendChild(el('hr', {}));
+    live.appendChild(suggestionsSection(cur, false));
+  });
+  const note = q.state === 'finalized'
+    ? 'This question is finalized — only an admin can change it now.'
+    : `This question isn’t in the review queue (${(STATE_META[q.state]?.label || q.state).toLowerCase()}), but you can still suggest an edit for the author.`;
+  const body = el('div', {}, [
+    el('p', { class: 'muted sm', text: note }),
+    live,
+    q.state !== 'finalized' ? el('hr', {}) : null,
+    q.state !== 'finalized' ? suggestionComposer(q) : null,
+  ]);
+  modal(`Question #${q.humanId}`, body, { wide: true, onClose: stop });
+}
+
+// Write a brand-new question from the Compile view. `initial` pre-fills the form
+// (e.g. the slot's subject and Toss-up/Bonus). Calls onCreated(question, submitted)
+// once it's saved as a draft or submitted for review.
+function openWriteForRound(initial, { context = '', onCreated } = {}) {
+  const form = buildQuestionForm(initial);
+  const msgHost = el('div', {});
+  const finish = (errors) => { clear(msgHost); if (errors.length) msgHost.appendChild(errorBox(errors)); };
+  let busy = false;
+  const run = async (submit) => {
+    if (busy) return;
+    const d = form.collect();
+    let data;
+    if (submit) {
+      const errors = validateForm(d);
+      finish(errors);
+      if (errors.length) { toast('Fix the highlighted issues first.', 'error'); return; }
+      data = await preSubmit(d, { verb: 'Submit' });
+      if (!data) return;
+    } else {
+      // A round slot is tied to a subject, so a draft needs at least that.
+      if (!d.subject) { finish(['Choose a subject so the question can go into the round.']); return; }
+      finish([]);
+      data = applyAutoFormat(d);
+    }
+    busy = true;
+    try {
+      const q = await S().createQuestion(data);
+      if (submit) await S().submitForReview(q.id);
+      m.close();
+      onCreated?.({ ...q, state: submit ? 'in_review' : q.state, status: submit ? 1 : q.status }, submit);
+    } catch (e) {
+      console.error('write for round', e);
+      toast(explainError(e), 'error');
+    } finally { busy = false; }
+  };
+  const body = el('div', {}, [
+    context ? el('p', { class: 'muted sm', text: context }) : null,
+    form.node, msgHost,
+    el('div', { class: 'row-end gap', style: 'margin-top:18px' }, [
+      el('button', { class: 'btn ghost', text: 'Cancel', onclick: () => m.close() }),
+      el('button', { class: 'btn ghost', text: 'Save as draft & place', onclick: () => run(false) }),
+      el('button', { class: 'btn primary', text: 'Submit for review & place', onclick: () => run(true) }),
+    ]),
+  ]);
+  const m = modal('Write a new question for this round', body, { wide: true });
+}
+
 // ── View: Compile a round ─────────────────────────────────────────────────────────
-// Admin-only. Pick questions into a 23-pair round (4 per main subject +
+// Open to every approved user. Pick questions into a 23-pair round (4 per main subject +
 // 3 Energy) as Toss-ups / Bonuses, live-edit any question, preview the
 // rendered round, then export LaTeX in the BSBcompile format. The pool's status
 // dropdown draws from finalized questions (default), unfinalized ones still in
@@ -2257,19 +2345,80 @@ function viewCompile() {
   const flushSave = async () => {
     if (!activeId || loadedWorkingId !== activeId || pendingHydrate) return;
     try {
-      const saved = await S().saveCompileDraft({
+      const payload = {
         id: activeId,
         composition: composition.map((c) => ({ subject: c.subject, pairs: c.pairs })),
-        slots: slots.map((s) => ({ subject: s.subject, tu: s.tu?.id || null, b: s.b?.id || null })),
-        roundNumber: titleInp.value.trim(),
-        shuffle: shuffleChk.checked,
-        fullDoc: fullDocChk.checked,
-      });
+        slots: workingRows(),
+        ...workingOpts(),
+      };
+      base = snapshotOf(payload); // what everyone will see once this lands
+      const saved = await S().saveCompileDraft(payload);
       const cur = getDraft(activeId);
       if (cur) Object.assign(cur, saved); // keep the local snapshot fresh (updatedAt)
     } catch (e) { console.error('saveCompileDraft', e); toast('Couldn’t save the draft.', 'warn'); }
   };
   const queueSave = debounce(flushSave, 700);
+
+  // ── Merging other people's edits ──
+  // Drafts are shared, so several people may work in the same round at once.
+  // `base` is the draft as last synced (loaded or saved). When someone else saves,
+  // each cell (subject + pair number + TU/B) keeps the local value if this person
+  // changed it since `base`, and otherwise takes theirs — a three-way merge, so
+  // neither side's placements get thrown away.
+  let base = null;
+  let remoteWaiting = false; // a merge deferred until a drag finishes
+  const workingRows = () => slots.map((s) => ({ subject: s.subject, tu: s.tu?.id || null, b: s.b?.id || null }));
+  const workingOpts = () => ({ roundNumber: titleInp.value.trim(), shuffle: shuffleChk.checked, fullDoc: fullDocChk.checked });
+  const cellMap = (rows) => {
+    const m = new Map(); const n = {};
+    for (const r of rows || []) {
+      const i = (n[r.subject] = (n[r.subject] ?? -1) + 1);
+      m.set(`${r.subject}#${i}|tu`, r.tu || null);
+      m.set(`${r.subject}#${i}|b`, r.b || null);
+    }
+    return m;
+  };
+  const compOf = (comp) => Object.fromEntries(mergeComposition(comp).map((c) => [c.subject, c.pairs]));
+  const snapshotOf = (d) => ({
+    cells: cellMap(d.slots),
+    comp: compOf(d.composition),
+    opts: { roundNumber: String(d.roundNumber ?? '').trim(), shuffle: d.shuffle !== false, fullDoc: d.fullDoc !== false },
+  });
+  const sameCells = (a, b) => { for (const k of new Set([...a.keys(), ...b.keys()])) if ((a.get(k) ?? null) !== (b.get(k) ?? null)) return false; return true; };
+  const sameJson = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+  const sameSnap = (a, b) => sameCells(a.cells, b.cells) && sameJson(a.comp, b.comp) && sameJson(a.opts, b.opts);
+
+  const mergeRemote = (d) => {
+    if (!d || !base || pendingHydrate || !byLoaded) return;
+    if (dragSrc) { remoteWaiting = true; return; }
+    const remote = snapshotOf(d);
+    if (sameSnap(remote, base)) return; // nothing new from anyone else
+    const local = snapshotOf({ slots: workingRows(), composition, ...workingOpts() });
+    const pick = (l, b, r) => (l !== b ? l : r);
+    const known = new Map();
+    for (const s of slots) for (const q of [s.tu, s.b]) if (q) known.set(q.id, q);
+    const lookup = (id) => (id ? byId.get(id) || writtenHere.get(id) || known.get(id) || null : null);
+
+    setComposition(composition.map((c) => ({ subject: c.subject, pairs: pick(local.comp[c.subject], base.comp[c.subject], remote.comp[c.subject]) })));
+    updateCompTotal();
+    buildSlots(false);
+    const n = {};
+    for (const s of slots) {
+      const i = (n[s.subject] = (n[s.subject] ?? -1) + 1);
+      for (const role of ['tu', 'b']) {
+        const k = `${s.subject}#${i}|${role}`;
+        s[role] = lookup(pick(local.cells.get(k) ?? null, base.cells.get(k) ?? null, remote.cells.get(k) ?? null));
+      }
+    }
+    titleInp.value = pick(local.opts.roundNumber, base.opts.roundNumber, remote.opts.roundNumber);
+    shuffleChk.checked = pick(local.opts.shuffle, base.opts.shuffle, remote.opts.shuffle);
+    fullDocChk.checked = pick(local.opts.fullDoc, base.opts.fullDoc, remote.opts.fullDoc);
+    base = remote;
+    drawAll();
+    // If this person had unsaved changes on top, save the merged result.
+    if (!sameSnap(snapshotOf({ slots: workingRows(), composition, ...workingOpts() }), remote)) queueSave();
+    if (d.updatedByUid && d.updatedByUid !== app.user.uid) toast(`${d.updatedByName || 'Someone'} updated this round — merged in.`);
+  };
 
   const usedIds = () => new Set(slots.flatMap((s) => [s.tu?.id, s.b?.id].filter(Boolean)));
   // Ids placed more than once in this round (only possible via older drafts or
@@ -2345,16 +2494,141 @@ function viewCompile() {
   const poolCount = el('span', { class: 'muted sm' });
   const poolList = el('div', { class: 'compile-pool' });
 
-  // Assign a question to the first open slot of `role` whose subject matches.
-  const assign = (q, role) => {
-    if (!draftsLoaded || loadedWorkingId !== activeId) { toast('Still loading round drafts — try again in a moment.', 'warn'); return; }
-    if (usedIds().has(q.id)) { toast('That question is already in the round.', 'warn'); return; }
+  // Why `q` can't go into this round right now, or null if it can.
+  const placeBlocker = (q) => {
+    if (!draftsLoaded || loadedWorkingId !== activeId) return 'Still loading round drafts — try again in a moment.';
+    if (usedIds().has(q.id)) return 'That question is already in the round.';
     const elsewhere = otherDraftUse().get(q.id);
-    if (elsewhere) { toast(`That question is already used in draft “${elsewhere}”.`, 'warn'); return; }
-    const slot = slots.find((s) => s.subject === q.subject && s[role] == null);
-    if (!slot) { toast(`No open ${role === 'tu' ? 'Toss-up' : 'Bonus'} slot for ${q.subject}.`, 'warn'); return; }
+    if (elsewhere) return `That question is already used in draft “${elsewhere}”.`;
+    return null;
+  };
+  // Put `q` into one specific slot. Returns an error message, or null on success.
+  const placeInto = (slot, role, q) => {
+    const err = placeBlocker(q);
+    if (err) return err;
+    if (!slot || !slots.includes(slot)) return 'That slot no longer exists in this draft.';
+    if (slot.subject !== q.subject) return `#${q.humanId} is ${q.subject || 'missing a subject'}, but that slot is ${slot.subject}.`;
+    if (slot[role]) return 'Someone already filled that slot.';
     slot[role] = q;
     redraw();
+    return null;
+  };
+  // Put `q` into the first open slot of `role` whose subject matches.
+  const placeNext = (q, role) => {
+    const err = placeBlocker(q);
+    if (err) return err;
+    const slot = slots.find((s) => s.subject === q.subject && s[role] == null);
+    if (!slot) return `No open ${role === 'tu' ? 'Toss-up' : 'Bonus'} slot for ${q.subject || 'that subject'}.`;
+    slot[role] = q;
+    redraw();
+    return null;
+  };
+  const assign = (q, role) => { const err = placeNext(q, role); if (err) toast(err, 'warn'); };
+
+  // Questions written from this view. The shared question feed can take a moment
+  // to include them, so slot refreshes keep these instead of dropping them.
+  const writtenHere = new Map(); // id → question
+  const liveQ = (q) => (q ? byId.get(q.id) || writtenHere.get(q.id) || null : null);
+
+  // Pick an existing question for one specific slot.
+  const openPicker = (slot, role) => {
+    const key = slot.key;
+    const roleLabel = role === 'tu' ? 'Toss-up' : 'Bonus';
+    const wantTub = role === 'tu' ? 'TU' : 'B';
+    const pf = { status: 'all', onlyRole: true, q: '' };
+    const statusPick = el('select', { class: 'inp sm' });
+    fillSelect(statusPick, [
+      { value: 'all', label: 'All questions' },
+      { value: 'finalized', label: '★ Finalized' },
+      { value: 'unfinalized', label: 'Unfinalized' },
+    ], { value: (x) => x.value, label: (x) => x.label, selected: 'all' });
+    const roleChk = el('input', { type: 'checkbox', checked: true });
+    const searchPick = el('input', { class: 'inp sm grow', placeholder: 'Search question or answer…' });
+    const list = el('div', { class: 'compile-pool compile-picker' });
+    const count = el('span', { class: 'muted sm' });
+    const draw = () => {
+      const used = usedIds(); const taken = otherDraftUse();
+      const needle = pf.q.toLowerCase();
+      const rows = all.filter((q) => q.subject === slot.subject && !used.has(q.id) && !taken.has(q.id)
+        && (!pf.onlyRole || q.tub === wantTub)
+        && (pf.status === 'all' || (pf.status === 'finalized' ? q.state === 'finalized' : q.state !== 'finalized'))
+        && (!needle || (q.questionText || '').toLowerCase().includes(needle) || (q.answerLine || '').toLowerCase().includes(needle)));
+      count.textContent = `${rows.length} available`;
+      clear(list);
+      if (!rows.length) { list.appendChild(el('p', { class: 'muted sm', style: 'padding:8px', text: 'No unused questions match. Try “All questions”, untick the Toss-up/Bonus filter, or write a new one.' })); return; }
+      for (const q of rows) {
+        list.appendChild(el('div', { class: 'compile-poolrow' }, [
+          el('div', { class: 'compile-poolrow-main' }, [
+            el('div', { class: 'compile-chips' }, [
+              el('span', { class: 'chip subtle', text: '#' + q.humanId }),
+              q.subcat ? el('span', { class: 'chip subtle', text: q.subcat }) : null,
+              el('span', { class: 'chip subtle', text: q.tub }),
+              el('span', { class: 'chip subtle', text: q.type }),
+              q.difficulty ? el('span', { class: 'chip subtle', text: 'D' + q.difficulty }) : null,
+              q.state !== 'finalized' ? el('span', { class: 'chip warn', text: 'not final' }) : null,
+            ]),
+            el('div', { class: 'compile-qtext', text: snippet(q.questionText, 200) }),
+          ]),
+          el('div', { class: 'compile-poolrow-actions' }, [
+            el('button', { class: 'btn ghost xs', text: 'View', onclick: () => modal(`Question #${q.humanId}`, questionDetail(q), { wide: true }) }),
+            el('button', { class: 'btn primary xs', text: 'Place here', onclick: () => {
+              const err = placeInto(findSlot(key), role, q);
+              if (err) { toast(err, 'warn'); return; }
+              toast(`Placed #${q.humanId} as a ${slot.subject} ${roleLabel}.`, 'success');
+              m.close();
+            } }),
+          ]),
+        ]));
+      }
+    };
+    statusPick.addEventListener('change', () => { pf.status = statusPick.value; draw(); });
+    roleChk.addEventListener('change', () => { pf.onlyRole = roleChk.checked; draw(); });
+    searchPick.addEventListener('input', () => { pf.q = searchPick.value; draw(); });
+    draw();
+    const m = modal(`Pick a ${slot.subject} ${roleLabel}`, el('div', {}, [
+      el('div', { class: 'filters wrap', style: 'margin-bottom:10px' }, [
+        statusPick,
+        el('label', { class: 'compile-check' }, [roleChk, el('span', { class: 'sm', text: `Only ${roleLabel}s` })]),
+        searchPick, count,
+      ]),
+      list,
+      el('div', { class: 'row-end gap', style: 'margin-top:14px' }, [
+        el('button', { class: 'btn ghost', text: 'Write a new one instead', onclick: () => { m.close(); writeInto(findSlot(key) || slot, role); } }),
+      ]),
+    ]), { wide: true });
+  };
+
+  // Write a new question straight into a slot (or, with no slot, into the next
+  // open slot that fits it).
+  const writeInto = (slot, role) => {
+    const draftId = activeId;
+    const draftName = getDraft(draftId)?.name || 'this draft';
+    const key = slot ? slot.key : null;
+    const initial = slot
+      ? { subject: slot.subject, tub: role === 'tu' ? 'TU' : 'B' }
+      : { subject: filters.subject || '', subcat: filters.subcat || '', tub: filters.tub || '', difficulty: filters.difficulty ? Number(filters.difficulty) : undefined };
+    const context = slot
+      ? `This question goes into “${draftName}” as a ${slot.subject} ${role === 'tu' ? 'Toss-up' : 'Bonus'}. Submit it for review, or save it as a draft to finish later — either way it’s placed in the round now.`
+      : `This question goes into the next open slot in “${draftName}” that matches its subject and Toss-up/Bonus.`;
+    openWriteForRound(initial, {
+      context,
+      onCreated: (created, submitted) => {
+        writtenHere.set(created.id, created);
+        const q = byId.get(created.id) || created;
+        const what = submitted ? 'submitted for review' : 'saved as a draft';
+        if (activeId !== draftId) { toast(`#${q.humanId} ${what}. You switched drafts, so it wasn’t placed — find it in the pool.`, 'warn'); return; }
+        const r = slot ? role : (q.tub === 'B' ? 'b' : 'tu');
+        const target = key ? findSlot(key) : null;
+        let err = target && target.subject === q.subject && !target[r] ? placeInto(target, r, q) : placeNext(q, r);
+        if (err) {
+          // Leave it visible in the pool so it can be placed by hand.
+          if (filters.status === 'finalized') { filters.status = 'unfinalized'; statusSel.value = 'unfinalized'; drawPool(); }
+          toast(`#${q.humanId} ${what}, but not placed: ${err} It’s in the pool.`, 'warn');
+          return;
+        }
+        toast(`#${q.humanId} ${what} and placed in the round.`, 'success');
+      },
+    });
   };
 
   const matchesStatus = (q) => filters.status === 'all'
@@ -2401,7 +2675,8 @@ function viewCompile() {
             ]
           : [
               el('button', { class: 'btn ghost xs', text: 'View', onclick: () => modal(`Question #${q.humanId}`, questionDetail(q), { wide: true }) }),
-              el('button', { class: 'btn ghost xs', text: '✎', title: 'Edit #' + q.humanId, onclick: () => openAdminEditor(q) }),
+              canEditDirectly(q) ? el('button', { class: 'btn ghost xs', text: '✎', title: 'Edit #' + q.humanId, onclick: () => editFromCompile(q) }) : null,
+              el('button', { class: 'btn ghost xs', text: '⚖', title: 'Review / suggest edits for #' + q.humanId, onclick: () => reviewFromCompile(q) }),
               el('button', { class: 'btn ghost xs', text: '→ TU', title: 'Add as the next open Toss-up for ' + q.subject, onclick: () => assign(q, 'tu') }),
               el('button', { class: 'btn ghost xs', text: '→ B', title: 'Add as the next open Bonus for ' + q.subject, onclick: () => assign(q, 'b') }),
             ]),
@@ -2464,7 +2739,10 @@ function viewCompile() {
     if (!q) {
       node.append(
         el('span', { class: 'compile-target-role', text: roleLabel }),
-        el('span', { class: 'muted sm', text: 'empty' }),
+        el('span', { class: 'compile-empty-actions' }, [
+          el('button', { class: 'btn ghost xs', text: '＋ Pick', title: `Choose an existing ${slot.subject} question for this ${roleLabel} slot`, onclick: () => openPicker(slot, role) }),
+          el('button', { class: 'btn ghost xs', text: '✎ Write', title: `Write a new ${slot.subject} ${roleLabel} for this slot`, onclick: () => writeInto(slot, role) }),
+        ]),
       );
       return node;
     }
@@ -2474,7 +2752,10 @@ function viewCompile() {
     node.setAttribute('draggable', 'true');
     node.title = 'Drag to re-pair (same subject)';
     node.addEventListener('dragstart', (e) => { dragSrc = { key: slot.key, role, subject: slot.subject }; node.classList.add('dragging'); e.dataTransfer.effectAllowed = 'move'; try { e.dataTransfer.setData('text/plain', slot.key + '|' + role); } catch {} });
-    node.addEventListener('dragend', () => { dragSrc = null; node.classList.remove('dragging'); roundHost.querySelectorAll('.drag-over').forEach((n) => n.classList.remove('drag-over')); });
+    node.addEventListener('dragend', () => {
+      dragSrc = null; node.classList.remove('dragging'); roundHost.querySelectorAll('.drag-over').forEach((n) => n.classList.remove('drag-over'));
+      if (remoteWaiting) { remoteWaiting = false; mergeRemote(getDraft(activeId)); }
+    });
     node.append(
       el('div', { class: 'compile-target-head' }, [
         el('span', { class: 'drag-grip', text: '⠿', title: 'Drag to re-pair' }),
@@ -2486,8 +2767,9 @@ function viewCompile() {
         twice ? el('span', { class: 'chip danger', title: 'This question is placed more than once in this round — remove the extra', text: 'twice in round' }) : null,
         alsoIn ? el('span', { class: 'chip danger', title: 'Also placed in round draft “' + alsoIn + '” — remove it from one of them', text: 'also in ' + alsoIn }) : null,
         el('span', { style: 'margin-left:auto; display:flex; gap:2px' }, [
-          el('button', { class: 'icon-btn sm', text: '✎', title: 'Edit #' + q.humanId, onclick: () => openAdminEditor(q) }),
-          el('button', { class: 'icon-btn sm', text: '✕', title: 'Remove', onclick: () => { slot[role] = null; redraw(); } }),
+          canEditDirectly(q) ? el('button', { class: 'icon-btn sm', text: '✎', title: 'Edit #' + q.humanId, onclick: () => editFromCompile(q) }) : null,
+          el('button', { class: 'icon-btn sm', text: '⚖', title: 'Review / suggest edits for #' + q.humanId, onclick: () => reviewFromCompile(q) }),
+          el('button', { class: 'icon-btn sm', text: '✕', title: 'Remove from the round (the question itself is kept)', onclick: () => { slot[role] = null; redraw(); } }),
         ]),
       ]),
       el('div', { class: 'compile-qtext', text: snippet(q.questionText, 90) }),
@@ -2553,6 +2835,7 @@ function viewCompile() {
     const d = getDraft(id);
     if (!d) { loadedWorkingId = null; return; }
     loadedWorkingId = id;
+    base = snapshotOf(d);
     setComposition(d.composition);
     titleInp.value = d.roundNumber ?? '';
     shuffleChk.checked = d.shuffle !== false;
@@ -2663,7 +2946,7 @@ function viewCompile() {
             el('button', { class: 'btn ' + (isActive ? 'ghost' : 'primary') + ' sm', text: isActive ? 'Active' : (isOpen ? 'Switch to' : 'Open'), disabled: isActive, onclick: () => loadDraft(d.id) }),
             el('button', { class: 'btn ghost sm', text: 'Rename', onclick: () => renameDraft(d.id) }),
             el('button', { class: 'btn ghost sm', text: 'Duplicate', onclick: () => duplicateDraft(d.id) }),
-            el('button', { class: 'btn danger sm', text: 'Delete', onclick: () => deleteDraft(d.id) }),
+            app.user.role === 'admin' ? el('button', { class: 'btn danger sm', text: 'Delete', onclick: () => deleteDraft(d.id) }) : null,
           ]),
         ]));
       }
@@ -2710,7 +2993,10 @@ function viewCompile() {
     if (!openIds.includes(activeId)) activeId = openIds[0];
     saveUi();
     if (loadedWorkingId !== activeId) loadWorkingFromDraft(activeId);
-    else { drawDraftBar(); refreshManager?.(); drawPool(); drawRound(); } // other drafts' picks changed
+    else {
+      mergeRemote(getDraft(activeId)); // someone else may have edited this round
+      drawDraftBar(); refreshManager?.(); drawPool(); drawRound(); // other drafts' picks changed
+    }
   };
 
   // ── Preview (right) — rendered round in export order (build order) ──
@@ -2721,7 +3007,10 @@ function viewCompile() {
     const head = el('div', { class: 'pv-qhead' }, [
       el('span', { class: 'pv-num', text: n + ')' }),
       el('span', { class: 'pv-subj', html: `${escapeHtml(q.subject)} — <em>${q.type === 'SA' ? 'Short Answer' : 'Multiple Choice'}</em>` }),
-      el('button', { class: 'icon-btn sm', text: '✎', title: 'Edit #' + q.humanId, style: 'margin-left:auto', onclick: () => openAdminEditor(q) }),
+      el('span', { style: 'margin-left:auto; display:flex; gap:2px' }, [
+        canEditDirectly(q) ? el('button', { class: 'icon-btn sm', text: '✎', title: 'Edit #' + q.humanId, onclick: () => editFromCompile(q) }) : null,
+        el('button', { class: 'icon-btn sm', text: '⚖', title: 'Review / suggest edits for #' + q.humanId, onclick: () => reviewFromCompile(q) }),
+      ]),
     ]);
     const body = el('div', { class: 'render-block pv-body', html: renderMixedToString(q.questionText) });
     const kids = [head, body];
@@ -2837,7 +3126,10 @@ function viewCompile() {
   const saved = (() => { try { return JSON.parse(localStorage.getItem('sbq-compile-layout') || '{}'); } catch { return {}; } })();
   const panels = [
     { key: 'pool', grow: saved.pool?.grow ?? 1, hidden: saved.pool?.hidden ?? false, node: el('section', { class: 'compile-panel' }, [
-      el('div', { class: 'compile-col-head' }, [el('h3', { text: 'Question pool' }), poolCount]),
+      el('div', { class: 'compile-col-head' }, [
+        el('h3', { text: 'Question pool' }),
+        el('span', { class: 'row-mid', style: 'gap:8px' }, [poolCount, el('button', { class: 'btn ghost xs', text: '＋ Write new', title: 'Write a new question and drop it into the next open slot that fits', onclick: () => writeInto(null, null) })]),
+      ]),
       el('div', { class: 'filters wrap' }, [statusSel, subjectSel, subcatSel, tubSel, diffSel, search]),
       poolList,
     ]) },
@@ -2906,7 +3198,7 @@ function viewCompile() {
   host.appendChild(el('div', { class: 'page compile-page' }, [
     el('div', { class: 'page-head' }, [
       el('h1', { text: 'Compile a round' }),
-      el('p', { class: 'muted', text: 'Assign questions into Toss-up / Bonus pairs, edit them live, preview the round, then export LaTeX. Use the pool’s status dropdown to pull from finalized or still-unfinalized questions. Work in a draft — keep several open as tabs; each autosaves. Drag the gutters to resize; use Panels to hide sections.' }),
+      el('p', { class: 'muted', text: 'Fill Toss-up / Bonus pairs from the pool, or use an empty slot’s “Pick” to choose an existing question or “Write” to write a new one straight into the round. ✎ edits a question you’re allowed to change; ⚖ reviews it or suggests an edit. Drafts are shared with everyone and autosave — changes from others merge in live. Drag the gutters to resize; use Panels to hide sections.' }),
     ]),
     draftBar,
     toggleBar,
@@ -2936,8 +3228,8 @@ function viewCompile() {
     } else {
       // Live-refresh existing slot references so admin edits/(un)finalizing show.
       for (const s of slots) {
-        if (s.tu) s.tu = byId.get(s.tu.id) || null;
-        if (s.b) s.b = byId.get(s.b.id) || null;
+        s.tu = liveQ(s.tu);
+        s.b = liveQ(s.b);
       }
     }
     drawAll(); // a finalized-pool change shouldn't rewrite the draft

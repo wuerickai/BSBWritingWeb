@@ -10,6 +10,7 @@ A complete web app for **writing, reviewing, and finalizing Science Bowl questio
 - Each question gets a **numeric ID**, a **writer name + initials**, and a **status equal to the number of times it has been in review**.
 - **Review panel**: any reviewer can sort/filter the queue, add comments, and **send a question back to its author**, or **approve it** into the finalized database.
 - **Live suggested edits** — reviewers can propose edits to the question text in a Google-Docs / Overleaf “suggesting” style: changes are shown as a live tracked-changes diff, and the author can **Accept** or **Reject** each one. Suggestions appear in real time.
+- **Compile rounds together**: every approved member can open **Compile**, fill Toss-up/Bonus slots from the pool, **pick** an existing question for a specific slot, or **write a new question** straight into a slot. Questions can be edited (admins: any; authors: their own) or reviewed / sent suggested edits without leaving the page. Round drafts are shared and merge everyone's changes live; only admins can delete a draft.
 - **Finalized database**: searchable, filterable, sortable, and exportable to **CSV** (same columns as your Master Sheet) or **JSON**.
 - **Bulk CSV import** (admin): load a spreadsheet in the same format as your Master Sheet; questions **enter at “in review”** and are assigned to a designated **“main” account**.
 - **Automatic backups**: every few minutes the full question set is snapshotted locally (IndexedDB); admins can download or restore any snapshot.
