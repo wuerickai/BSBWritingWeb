@@ -238,6 +238,19 @@ export async function adminEdit(id, patch) {
   await F.updateDoc(F.doc(db, 'questions', id), { ...patch, history, updatedAt: now() });
 }
 
+// Edit of someone else's question by any approved member (from the Compile view).
+// Only the question's content changes — never its state, author, or review count
+// — and the edit is logged in the history. firestore.rules limits this to
+// non-finalized questions and to the content fields below.
+export async function peerEdit(id, patch) {
+  const u = requireUser();
+  const q = await getQ(id);
+  const allowed = ['tub', 'subject', 'subcat', 'type', 'questionText', 'answerLine', 'choices', 'mcAnswer', 'mcAnswerText', 'difficulty', 'source'];
+  const data = Object.fromEntries(allowed.filter((k) => k in patch).map((k) => [k, patch[k]]));
+  const history = (q.history || []).concat({ at: now(), byUid: u.uid, byName: u.displayName || u.email, action: 'peer_edited', comment: '', statusAt: q.status });
+  await F.updateDoc(F.doc(db, 'questions', id), { ...data, history, updatedAt: now() });
+}
+
 export async function deleteQuestion(id) {
   await F.deleteDoc(F.doc(db, 'questions', id));
 }

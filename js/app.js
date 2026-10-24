@@ -859,7 +859,7 @@ function questionDetail(q) {
 }
 
 function historyTimeline(history) {
-  const labels = { submitted: 'Submitted for review', changes_requested: 'Changes requested', approved: 'Reviewed — looks good', finalized: 'Finalized', unfinalized: 'Unfinalized — back to review', comment: 'Comment', suggestion: 'Suggested an edit', suggestion_accepted: 'Suggestion accepted', suggestion_rejected: 'Suggestion rejected', imported: 'Imported from spreadsheet', edited: 'Edited by admin', archived: 'Removed to graveyard', restored: 'Restored from graveyard' };
+  const labels = { submitted: 'Submitted for review', changes_requested: 'Changes requested', approved: 'Reviewed — looks good', finalized: 'Finalized', unfinalized: 'Unfinalized — back to review', comment: 'Comment', suggestion: 'Suggested an edit', suggestion_accepted: 'Suggestion accepted', suggestion_rejected: 'Suggestion rejected', imported: 'Imported from spreadsheet', edited: 'Edited by admin', peer_edited: 'Edited in Compile', archived: 'Removed to graveyard', restored: 'Restored from graveyard' };
   return el('ul', { class: 'timeline' }, history.slice().reverse().map((h) => el('li', { class: 'tl-item tl-' + h.action }, [
     el('div', { class: 'tl-head' }, [
       el('span', { class: 'tl-action', text: labels[h.action] || h.action }),
@@ -915,28 +915,13 @@ function suggestionComposer(q) {
   fillSelect(diffSel, T.DIFFICULTIES, { value: (x) => x.value, label: (x) => x.label, selected: q.difficulty, placeholder: '—' });
   diffSel.addEventListener('change', () => update());
 
-  const collect = () => {
-    const payload = {};
-    if (hasChanges(q.questionText, ta.value)) { payload.baseText = q.questionText || ''; payload.proposedText = ta.value; }
-    const changedChoices = {};
-    const baseChoices = {};
-    for (const slot of Object.keys(choiceInputs)) {
-      if (hasChanges(q.choices?.[slot], choiceInputs[slot].value)) {
-        changedChoices[slot] = choiceInputs[slot].value;
-        baseChoices[slot] = q.choices?.[slot] || '';
-      }
-    }
-    if (Object.keys(changedChoices).length) { payload.proposedChoices = changedChoices; payload.baseChoices = baseChoices; }
-    if (mcAnswerSel && mcAnswerSel.value && mcAnswerSel.value !== (q.mcAnswer || '')) {
-      payload.baseMcAnswer = q.mcAnswer || ''; payload.proposedMcAnswer = mcAnswerSel.value;
-    }
-    if (ansInput && hasChanges(q.answerLine, ansInput.value)) {
-      payload.baseAnswerLine = q.answerLine || ''; payload.proposedAnswerLine = ansInput.value;
-    }
-    const newDiff = diffSel.value ? Number(diffSel.value) : null;
-    if (newDiff != null && newDiff !== (q.difficulty ?? null)) { payload.baseDifficulty = q.difficulty ?? null; payload.proposedDifficulty = newDiff; }
-    return payload;
-  };
+  const collect = () => suggestionPayload(q, {
+    questionText: ta.value,
+    choices: q.type === 'MC' ? Object.fromEntries(Object.keys(choiceInputs).map((slot) => [slot, choiceInputs[slot].value])) : null,
+    mcAnswer: mcAnswerSel ? mcAnswerSel.value : null,
+    answerLine: ansInput ? ansInput.value : null,
+    difficulty: diffSel.value ? Number(diffSel.value) : null,
+  });
 
   const update = () => {
     const p = collect();
@@ -975,6 +960,27 @@ function suggestionComposer(q) {
     el('div', { class: 'diff-label', text: 'Tracked change' }), diff,
     el('div', { class: 'row-end', style: 'margin-top:8px' }, [send]),
   ]);
+}
+
+// Turn edited values into a suggestion payload (only the fields that changed).
+// `edited` fields left null/undefined are treated as unchanged.
+function suggestionPayload(q, edited) {
+  const payload = {};
+  if (edited.questionText != null && hasChanges(q.questionText, edited.questionText)) { payload.baseText = q.questionText || ''; payload.proposedText = edited.questionText; }
+  if (edited.choices) {
+    const changedChoices = {}; const baseChoices = {};
+    for (const slot of T.MC_SLOTS) {
+      if (slot in edited.choices && hasChanges(q.choices?.[slot], edited.choices[slot])) {
+        changedChoices[slot] = edited.choices[slot];
+        baseChoices[slot] = q.choices?.[slot] || '';
+      }
+    }
+    if (Object.keys(changedChoices).length) { payload.proposedChoices = changedChoices; payload.baseChoices = baseChoices; }
+  }
+  if (edited.mcAnswer && edited.mcAnswer !== (q.mcAnswer || '')) { payload.baseMcAnswer = q.mcAnswer || ''; payload.proposedMcAnswer = edited.mcAnswer; }
+  if (edited.answerLine != null && hasChanges(q.answerLine, edited.answerLine)) { payload.baseAnswerLine = q.answerLine || ''; payload.proposedAnswerLine = edited.answerLine; }
+  if (edited.difficulty != null && edited.difficulty !== (q.difficulty ?? null)) { payload.baseDifficulty = q.difficulty ?? null; payload.proposedDifficulty = edited.difficulty; }
+  return payload;
 }
 
 // Render one suggestion's combined diff (text + choices + difficulty).
@@ -2192,15 +2198,70 @@ async function migrateLegacyDrafts() {
 // Everyone can work in the Compile view, but question permissions don't change:
 // admins edit any question directly, authors edit their own (until finalized),
 // and everyone else reviews / suggests edits through the normal review flow.
+// Anyone may edit a question that isn't finalized; finalized ones are admin-only.
 function canEditDirectly(q) {
-  if (app.user.role === 'admin') return true;
-  return q.writerUid === app.user.uid && q.state !== 'finalized';
+  return app.user.role === 'admin' || q.state !== 'finalized';
 }
 
 function editFromCompile(q) {
-  if (app.user.role === 'admin') return openAdminEditor(q);
   if (q.writerUid === app.user.uid && q.state !== 'finalized') return openEditor(q);
+  if (app.user.role === 'admin' && q.state === 'finalized') return openAdminEditor(q);
+  if (q.state !== 'finalized') return openPeerEditor(q);
   return reviewFromCompile(q);
+}
+
+// Edit someone else's question. The person chooses: save the change directly
+// (logged in the history), or send it to the author as a suggestion to review.
+function openPeerEditor(q) {
+  const form = buildQuestionForm(q);
+  const msgHost = el('div', {});
+  const finish = (errors) => { clear(msgHost); if (errors.length) msgHost.appendChild(errorBox(errors)); };
+  const isAdmin = app.user.role === 'admin';
+  const save = async () => {
+    const d = form.collect();
+    const errors = validateForm(d);
+    finish(errors);
+    if (errors.length) { toast('Fix the highlighted issues first.', 'error'); return; }
+    const formatted = await preSubmit(d, { excludeId: q.id, verb: 'Save' });
+    if (!formatted) return;
+    try {
+      if (isAdmin) await S().adminEdit(q.id, formatted);
+      else await S().peerEdit(q.id, formatted);
+      toast('Edits saved.', 'success'); m.close();
+    } catch (e) { console.error('peer edit', e); toast(explainError(e), 'error'); }
+  };
+  const suggest = async () => {
+    const d = form.collect();
+    const payload = suggestionPayload(q, {
+      questionText: d.questionText,
+      choices: q.type === 'MC' ? d.choices : null,
+      mcAnswer: q.type === 'MC' ? d.mcAnswer : null,
+      answerLine: q.type === 'SA' ? d.answerLine : null,
+      difficulty: d.difficulty,
+    });
+    const extra = ['tub', 'subject', 'subcat', 'type', 'source'].filter((k) => (d[k] || '') !== (q[k] || ''));
+    if (!Object.keys(payload).length) {
+      toast(extra.length ? 'Suggestions can only carry the text, choices, answer and difficulty — save directly to change the other fields.' : 'Make an edit first.', 'warn');
+      return;
+    }
+    const v = validateLatex(d.questionText, { allowEmpty: true });
+    if (!v.ok) { finish([v.errors[0]]); toast('Fix the LaTeX first.', 'error'); return; }
+    try {
+      await S().addSuggestion(q.id, payload);
+      toast(extra.length ? 'Suggestion sent. Changes to type/subject/category/source can’t go in a suggestion and were left out.' : 'Suggestion sent to the author for review.', extra.length ? 'warn' : 'success');
+      m.close();
+    } catch (e) { console.error('suggest from editor', e); toast(explainError(e), 'error'); }
+  };
+  const body = el('div', {}, [
+    el('p', { class: 'muted sm', text: `Editing #${q.humanId} by ${q.writerName || 'another writer'}. “Save edits” changes the question now and logs it in the history — it stays ${(STATE_META[q.state]?.label || q.state).toLowerCase()}. Or send your changes to the author as a suggestion to review and accept or reject.` }),
+    form.node, msgHost,
+    el('div', { class: 'row-end gap', style: 'margin-top:18px' }, [
+      el('button', { class: 'btn ghost', text: 'Cancel', onclick: () => m.close() }),
+      el('button', { class: 'btn ghost', text: 'Send as suggestion for review', onclick: suggest }),
+      el('button', { class: 'btn primary', text: 'Save edits', onclick: save }),
+    ]),
+  ]);
+  const m = modal(`Edit question #${q.humanId}`, body, { wide: true });
 }
 
 function reviewFromCompile(q) {
@@ -3198,7 +3259,7 @@ function viewCompile() {
   host.appendChild(el('div', { class: 'page compile-page' }, [
     el('div', { class: 'page-head' }, [
       el('h1', { text: 'Compile a round' }),
-      el('p', { class: 'muted', text: 'Fill Toss-up / Bonus pairs from the pool, or use an empty slot’s “Pick” to choose an existing question or “Write” to write a new one straight into the round. ✎ edits a question you’re allowed to change; ⚖ reviews it or suggests an edit. Drafts are shared with everyone and autosave — changes from others merge in live. Drag the gutters to resize; use Panels to hide sections.' }),
+      el('p', { class: 'muted', text: 'Fill Toss-up / Bonus pairs from the pool, or use an empty slot’s “Pick” to choose an existing question or “Write” to write a new one straight into the round. ✎ edits a question — save the change directly or send it to the author as a suggestion to review; ⚖ opens the full review. Drafts are shared with everyone and autosave — changes from others merge in live. Drag the gutters to resize; use Panels to hide sections.' }),
     ]),
     draftBar,
     toggleBar,

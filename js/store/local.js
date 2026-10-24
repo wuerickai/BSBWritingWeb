@@ -224,6 +224,18 @@ export async function adminEdit(id, patch) {
   });
 }
 
+// Edit of someone else's question by any approved member (mirrors firebase.js).
+export async function peerEdit(id, patch) {
+  const u = requireUser();
+  const allowed = ['tub', 'subject', 'subcat', 'type', 'questionText', 'answerLine', 'choices', 'mcAnswer', 'mcAnswerText', 'difficulty', 'source'];
+  return mutate(id, (q) => {
+    if (q.state === 'finalized') throw new Error('Finalized questions can only be edited by an admin.');
+    for (const k of allowed) if (k in patch) q[k] = patch[k];
+    q.history = q.history || [];
+    q.history.push({ at: now(), byUid: u.uid, byName: u.displayName || u.email, action: 'peer_edited', comment: '', statusAt: q.status });
+  });
+}
+
 export async function deleteQuestion(id) {
   const arr = allQuestions().filter((x) => x.id !== id);
   saveQuestions(arr);

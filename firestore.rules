@@ -90,6 +90,14 @@ service cloud.firestore {
           && request.resource.data.diff(resource.data).affectedKeys()
                .hasOnly(['state', 'status', 'history', 'finalizedAt', 'updatedAt', 'suggestions']))
         ||
+        // Peer edit (from the Compile view): any approved user may change the
+        // CONTENT of a non-finalized question — never its state, author, or
+        // review count. The change is logged in the history.
+        (resource.data.state != 'finalized'
+          && request.resource.data.diff(resource.data).affectedKeys()
+               .hasOnly(['tub', 'subject', 'subcat', 'type', 'questionText', 'answerLine', 'choices',
+                         'mcAnswer', 'mcAnswerText', 'difficulty', 'source', 'history', 'updatedAt']))
+        ||
         // Graveyard: any approved user may archive/restore a NON-finalized
         // question (touching only the archive flag + audit fields). Finalized
         // questions can only be archived by admins (the isAdmin branch above).
