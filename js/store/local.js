@@ -239,6 +239,23 @@ export async function peerEdit(id, patch) {
 export async function deleteQuestion(id) {
   const arr = allQuestions().filter((x) => x.id !== id);
   saveQuestions(arr);
+  return { removedFrom: await removeFromCompileDrafts(id) };
+}
+
+// Take a question out of every round draft it's placed in (mirrors firebase.js).
+export async function removeFromCompileDrafts(id) {
+  const u = requireUser();
+  const arr = read(K_COMPILE, []);
+  const names = [];
+  for (const d of arr) {
+    const slots = Array.isArray(d.slots) ? d.slots : [];
+    if (!slots.some((s) => s.tu === id || s.b === id)) continue;
+    d.slots = slots.map((s) => ({ ...s, tu: s.tu === id ? null : s.tu, b: s.b === id ? null : s.b }));
+    Object.assign(d, { updatedAt: now(), updatedByUid: u.uid, updatedByName: u.displayName || u.email });
+    names.push(d.name || 'Untitled draft');
+  }
+  if (names.length) { write(K_COMPILE, arr); emitCompile(); }
+  return names;
 }
 
 // ── Graveyard (soft-remove) ───────────────────────────────────────────────────
@@ -248,7 +265,7 @@ export async function deleteQuestion(id) {
 // UI and, for the firebase backend, in firestore.rules.
 export async function archiveQuestion(id, reason) {
   const u = requireUser();
-  return mutate(id, (q) => {
+  mutate(id, (q) => {
     q.archived = true;
     q.archivedAt = now();
     q.archivedBy = u.uid;
@@ -257,6 +274,7 @@ export async function archiveQuestion(id, reason) {
     q.history = q.history || [];
     q.history.push({ at: now(), byUid: u.uid, byName: u.displayName || u.email, action: 'archived', comment: reason || '', statusAt: q.status });
   });
+  return { removedFrom: await removeFromCompileDrafts(id) };
 }
 
 export async function restoreQuestion(id) {
@@ -437,6 +455,41 @@ export async function bulkUpsert(questions) {
 // ── Compile round drafts (shared) ─────────────────────────────────────────────
 // Mirrors the firebase backend: one shared set of round drafts. Open tabs live in
 // per-device UI state (the app keeps those in a separate localStorage key).
+// ── One round per question: placement claims ─────────────────────────────────
+// Before a question goes into a round draft, the person placing it claims it
+// (compileClaims/{questionId} → { draftId, at }). Claiming is atomic, so two
+// people can't both win the same question for different drafts, even within the
+// second before either draft saves. A claim lapses on its own once its draft no
+// longer holds the question: the draft is gone, or it saved since the claim
+// without the question (removed, cleared, graveyarded). A brand-new claim whose
+// draft hasn't saved yet stays valid for CLAIM_GRACE_MS.
+const CLAIM_GRACE_MS = 10 * 60 * 1000;
+function claimHolds(claim, draft, questionId) {
+  if (!draft) return false;
+  if ((draft.slots || []).some((s) => s.tu === questionId || s.b === questionId)) return true;
+  const savedSince = (draft.updatedAt || 0) > (claim.at || 0);
+  return !savedSince && now() - (claim.at || 0) < CLAIM_GRACE_MS;
+}
+const K_CLAIMS = 'sbq_compile_claims';
+
+export async function claimForDraft(questionId, draftId) {
+  const u = requireUser();
+  const claims = read(K_CLAIMS, {});
+  const c = claims[questionId];
+  if (c && c.draftId && c.draftId !== draftId) {
+    const draft = read(K_COMPILE, []).find((d) => d.id === c.draftId) || null;
+    if (claimHolds(c, draft, questionId)) return { ok: false, draftName: draft.name || 'another draft' };
+  }
+  claims[questionId] = { draftId, at: now(), byUid: u.uid, byName: u.displayName || u.email };
+  write(K_CLAIMS, claims);
+  return { ok: true };
+}
+
+export async function releaseClaim(questionId, draftId) {
+  const claims = read(K_CLAIMS, {});
+  if (claims[questionId]?.draftId === draftId) { delete claims[questionId]; write(K_CLAIMS, claims); }
+}
+
 export async function saveCompileDraft(draft) {
   const u = requireUser();
   const arr = read(K_COMPILE, []);

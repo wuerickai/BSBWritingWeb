@@ -253,6 +253,33 @@ export async function peerEdit(id, patch) {
 
 export async function deleteQuestion(id) {
   await F.deleteDoc(F.doc(db, 'questions', id));
+  return { removedFrom: await removeFromCompileDrafts(id) };
+}
+
+// Take a question out of every round draft it's placed in (used when it goes
+// to the Graveyard or is deleted), so it never comes back into a round on its
+// own — e.g. after a restore. Returns the affected drafts' names, or null if
+// the drafts couldn't be updated (the archive/delete itself still stands).
+export async function removeFromCompileDrafts(id) {
+  try {
+    const u = requireUser();
+    const snap = await F.getDocs(F.collection(db, 'compileDrafts'));
+    const names = [];
+    for (const d of snap.docs) {
+      const data = d.data();
+      const slots = Array.isArray(data.slots) ? data.slots : [];
+      if (!slots.some((s) => s.tu === id || s.b === id)) continue;
+      await F.updateDoc(d.ref, {
+        slots: slots.map((s) => ({ ...s, tu: s.tu === id ? null : s.tu, b: s.b === id ? null : s.b })),
+        updatedAt: now(), updatedByUid: u.uid, updatedByName: u.displayName || u.email,
+      });
+      names.push(data.name || 'Untitled draft');
+    }
+    return names;
+  } catch (e) {
+    console.error('removeFromCompileDrafts', e);
+    return null;
+  }
 }
 
 // ── Graveyard (soft-remove) ───────────────────────────────────────────────────
@@ -267,6 +294,7 @@ export async function archiveQuestion(id, reason) {
     archived: true, archivedAt: now(), archivedBy: u.uid, archivedByName: u.displayName || u.email, archivedReason: reason || '',
     history, updatedAt: now(),
   });
+  return { removedFrom: await removeFromCompileDrafts(id) };
 }
 
 export async function restoreQuestion(id) {
@@ -461,6 +489,53 @@ function draftShape(u, data, isNew) {
   out.updatedByUid = u.uid;
   out.updatedByName = u.displayName || u.email;
   return out;
+}
+
+// ── One round per question: placement claims ─────────────────────────────────
+// Before a question goes into a round draft, the person placing it claims it
+// (compileClaims/{questionId} → { draftId, at }). Claiming is atomic, so two
+// people can't both win the same question for different drafts, even within the
+// second before either draft saves. A claim lapses on its own once its draft no
+// longer holds the question: the draft is gone, or it saved since the claim
+// without the question (removed, cleared, graveyarded). A brand-new claim whose
+// draft hasn't saved yet stays valid for CLAIM_GRACE_MS.
+const CLAIM_GRACE_MS = 10 * 60 * 1000;
+function claimHolds(claim, draft, questionId) {
+  if (!draft) return false;
+  if ((draft.slots || []).some((s) => s.tu === questionId || s.b === questionId)) return true;
+  const savedSince = (draft.updatedAt || 0) > (claim.at || 0);
+  return !savedSince && now() - (claim.at || 0) < CLAIM_GRACE_MS;
+}
+
+// Resolves { ok: true } once `questionId` is claimed for `draftId`, or
+// { ok: false, draftName } if another draft holds it.
+export async function claimForDraft(questionId, draftId) {
+  const u = requireUser();
+  const ref = F.doc(db, 'compileClaims', questionId);
+  return F.runTransaction(db, async (tx) => {
+    const snap = await tx.get(ref);
+    if (snap.exists()) {
+      const c = snap.data();
+      if (c.draftId && c.draftId !== draftId) {
+        const dSnap = await tx.get(F.doc(db, 'compileDrafts', c.draftId));
+        const draft = dSnap.exists() ? dSnap.data() : null;
+        if (claimHolds(c, draft, questionId)) return { ok: false, draftName: draft.name || 'another draft' };
+      }
+    }
+    tx.set(ref, { draftId, at: now(), byUid: u.uid, byName: u.displayName || u.email });
+    return { ok: true };
+  });
+}
+
+// Drop this draft's claim on a question (best effort; claims also lapse alone).
+export async function releaseClaim(questionId, draftId) {
+  try {
+    const ref = F.doc(db, 'compileClaims', questionId);
+    await F.runTransaction(db, async (tx) => {
+      const snap = await tx.get(ref);
+      if (snap.exists() && snap.data().draftId === draftId) tx.delete(ref);
+    });
+  } catch (e) { console.error('releaseClaim', e); }
 }
 
 export async function saveCompileDraft(draft) {

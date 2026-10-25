@@ -1047,6 +1047,13 @@ function canArchive(q) {
 
 // A small modal that captures an optional reason, then archives the question.
 // `onDone` fires after success (used to close a parent modal).
+// " Removed from round “X”." after a graveyard move / delete, when it was placed.
+function roundsNote(res) {
+  const names = res?.removedFrom;
+  if (!names?.length) return '';
+  return ` Removed from round ${names.map((n) => '“' + n + '”').join(', ')}.`;
+}
+
 function archiveDialog(q, onDone) {
   const reason = el('textarea', { class: 'inp', rows: 2, placeholder: 'Optional: why is this being removed? (kept with the question)' });
   const stateLabel = (STATE_META[q.state]?.label || q.state);
@@ -1063,8 +1070,8 @@ function archiveDialog(q, onDone) {
   btn.addEventListener('click', async () => {
     btn.disabled = true;
     try {
-      await S().archiveQuestion(q.id, reason.value.trim());
-      m.close(); toast('Moved to the Graveyard.', 'success'); if (onDone) onDone();
+      const res = await S().archiveQuestion(q.id, reason.value.trim());
+      m.close(); toast('Moved to the Graveyard.' + roundsNote(res), 'success'); if (onDone) onDone();
     } catch (e) { btn.disabled = false; toast(explainError(e), 'error'); }
   });
   const m = modal('Remove to graveyard', body);
@@ -1123,7 +1130,7 @@ function graveyardCard(q) {
   if (app.user.role === 'admin') {
     actions.appendChild(el('button', {
       class: 'btn danger sm', text: 'Delete forever', onclick: async () => {
-        if (await confirmDialog(`Permanently delete question #${q.humanId}? This cannot be undone.`, { danger: true, confirmText: 'Delete forever' })) { await S().deleteQuestion(q.id); toast('Deleted permanently.'); }
+        if (await confirmDialog(`Permanently delete question #${q.humanId}? This cannot be undone.`, { danger: true, confirmText: 'Delete forever' })) { const res = await S().deleteQuestion(q.id); toast('Deleted permanently.' + roundsNote(res)); }
       },
     }));
   }
@@ -1188,7 +1195,7 @@ function myCard(q) {
     actions.appendChild(el('button', { class: 'btn primary sm', text: pend > 0 ? 'Revise, resolve & resubmit' : 'Revise & resubmit', onclick: () => openEditor(q) }));
   } else if (q.state === 'draft') {
     actions.appendChild(el('button', { class: 'btn primary sm', text: 'Edit', onclick: () => openEditor(q) }));
-    actions.appendChild(el('button', { class: 'btn danger sm', text: 'Delete', onclick: async () => { if (await confirmDialog('Delete this draft?', { danger: true, confirmText: 'Delete' })) { await S().deleteQuestion(q.id); toast('Draft deleted.'); } } }));
+    actions.appendChild(el('button', { class: 'btn danger sm', text: 'Delete', onclick: async () => { if (await confirmDialog('Delete this draft?', { danger: true, confirmText: 'Delete' })) { const res = await S().deleteQuestion(q.id); toast('Draft deleted.' + roundsNote(res)); } } }));
   } else if (q.state === 'in_review') {
     actions.appendChild(el('button', { class: 'btn primary sm', text: pend > 0 ? 'Edit & resolve suggestions' : 'Edit', onclick: () => openEditor(q) }));
   }
@@ -2563,28 +2570,45 @@ function viewCompile() {
     if (elsewhere) return `That question is already used in draft “${elsewhere}”.`;
     return null;
   };
-  // Put `q` into one specific slot. Returns an error message, or null on success.
-  const placeInto = (slot, role, q) => {
-    const err = placeBlocker(q);
+  // Claim `q` for the active draft in the database, then (if nothing changed
+  // while waiting) put it into the slot `pickSlot()` returns and save at once.
+  // This is the hard guarantee that a question sits in only one round: the claim
+  // can't succeed for two drafts at the same time. Resolves to an error message,
+  // or null on success.
+  const placing = new Set(); // question ids with a claim in flight
+  const claimAndPlace = async (q, role, pickSlot) => {
+    let err = placeBlocker(q);
     if (err) return err;
+    if (typeof pickSlot() === 'string') return pickSlot();
+    if (placing.has(q.id)) return 'Already placing that question…';
+    const draftId = activeId;
+    placing.add(q.id);
+    let res;
+    try { res = await S().claimForDraft(q.id, draftId); }
+    catch (e) { console.error('claimForDraft', e); return 'Couldn’t reserve that question: ' + explainError(e); }
+    finally { placing.delete(q.id); }
+    if (!res.ok) return `That question is already used in draft “${res.draftName}”.`;
+    // Re-check: the draft, the slot or the round may have changed meanwhile.
+    const slot = activeId === draftId ? pickSlot() : 'You switched drafts, so it wasn’t placed.';
+    err = typeof slot === 'string' ? slot : (usedIds().has(q.id) ? 'That question is already in the round.' : null);
+    if (err) { S().releaseClaim(q.id, draftId); return err; }
+    slot[role] = q;
+    drawAll();
+    flushSave(); // save now (not debounced) so the claim is backed by the draft right away
+    return null;
+  };
+  // Put `q` into one specific slot.
+  const placeInto = (slot, role, q) => claimAndPlace(q, role, () => {
     if (!slot || !slots.includes(slot)) return 'That slot no longer exists in this draft.';
     if (slot.subject !== q.subject) return `#${q.humanId} is ${q.subject || 'missing a subject'}, but that slot is ${slot.subject}.`;
     if (slot[role]) return 'Someone already filled that slot.';
-    slot[role] = q;
-    redraw();
-    return null;
-  };
+    return slot;
+  });
   // Put `q` into the first open slot of `role` whose subject matches.
-  const placeNext = (q, role) => {
-    const err = placeBlocker(q);
-    if (err) return err;
-    const slot = slots.find((s) => s.subject === q.subject && s[role] == null);
-    if (!slot) return `No open ${role === 'tu' ? 'Toss-up' : 'Bonus'} slot for ${q.subject || 'that subject'}.`;
-    slot[role] = q;
-    redraw();
-    return null;
-  };
-  const assign = (q, role) => { const err = placeNext(q, role); if (err) toast(err, 'warn'); };
+  const placeNext = (q, role) => claimAndPlace(q, role, () =>
+    slots.find((s) => s.subject === q.subject && s[role] == null)
+    || `No open ${role === 'tu' ? 'Toss-up' : 'Bonus'} slot for ${q.subject || 'that subject'}.`);
+  const assign = async (q, role) => { const err = await placeNext(q, role); if (err) toast(err, 'warn'); };
 
   // Questions written from this view. The shared question feed can take a moment
   // to include them, so slot refreshes keep these instead of dropping them.
@@ -2632,8 +2656,8 @@ function viewCompile() {
           ]),
           el('div', { class: 'compile-poolrow-actions' }, [
             el('button', { class: 'btn ghost xs', text: 'View', onclick: () => modal(`Question #${q.humanId}`, questionDetail(q), { wide: true }) }),
-            el('button', { class: 'btn primary xs', text: 'Place here', onclick: () => {
-              const err = placeInto(findSlot(key), role, q);
+            el('button', { class: 'btn primary xs', text: 'Place here', onclick: async () => {
+              const err = await placeInto(findSlot(key), role, q);
               if (err) { toast(err, 'warn'); return; }
               toast(`Placed #${q.humanId} as a ${slot.subject} ${roleLabel}.`, 'success');
               m.close();
@@ -2673,14 +2697,14 @@ function viewCompile() {
       : `This question goes into the next open slot in “${draftName}” that matches its subject and Toss-up/Bonus.`;
     openWriteForRound(initial, {
       context,
-      onCreated: (created, submitted) => {
+      onCreated: async (created, submitted) => {
         writtenHere.set(created.id, created);
         const q = byId.get(created.id) || created;
         const what = submitted ? 'submitted for review' : 'saved as a draft';
         if (activeId !== draftId) { toast(`#${q.humanId} ${what}. You switched drafts, so it wasn’t placed — find it in the pool.`, 'warn'); return; }
         const r = slot ? role : (q.tub === 'B' ? 'b' : 'tu');
         const target = key ? findSlot(key) : null;
-        let err = target && target.subject === q.subject && !target[r] ? placeInto(target, r, q) : placeNext(q, r);
+        const err = target && target.subject === q.subject && !target[r] ? await placeInto(target, r, q) : await placeNext(q, r);
         if (err) {
           // Leave it visible in the pool so it can be placed by hand.
           if (filters.status === 'finalized') { filters.status = 'unfinalized'; statusSel.value = 'unfinalized'; drawPool(); }
@@ -3288,6 +3312,7 @@ function viewCompile() {
       pendingHydrate = null;
     } else {
       // Live-refresh existing slot references so admin edits/(un)finalizing show.
+      for (const id of [...writtenHere.keys()]) if (app.allQuestions.some((x) => x.id === id)) writtenHere.delete(id);
       for (const s of slots) {
         s.tu = liveQ(s.tu);
         s.b = liveQ(s.b);

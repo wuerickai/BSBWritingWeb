@@ -122,6 +122,13 @@ service cloud.firestore {
       allow delete: if isAdmin();
     }
 
+    // ── One round per question: placement claims ───────────────────
+    // compileClaims/{questionId} records which round draft holds a question, so
+    // two people can't place it into different rounds at the same moment.
+    match /compileClaims/{questionId} {
+      allow read, write: if isApproved();
+    }
+
     // ── Sequential human-friendly ID counter ───────────────────────
     match /meta/{doc} {
       allow read, write: if isApproved();
