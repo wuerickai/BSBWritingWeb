@@ -263,7 +263,7 @@ export async function deleteQuestion(id) {
 export async function removeFromCompileDrafts(id) {
   try {
     const u = requireUser();
-    const snap = await F.getDocs(F.collection(db, 'compileDrafts'));
+    const snap = await F.getDocs(draftsQuery());
     const names = [];
     for (const d of snap.docs) {
       const data = d.data();
@@ -275,6 +275,7 @@ export async function removeFromCompileDrafts(id) {
       });
       names.push(data.name || 'Untitled draft');
     }
+    try { await F.deleteDoc(claimRef(id)); } catch { /* none, or not allowed */ }
     return names;
   } catch (e) {
     console.error('removeFromCompileDrafts', e);
@@ -492,38 +493,55 @@ function draftShape(u, data, isNew) {
   return out;
 }
 
+// ── Where Compile data lives ──────────────────────────────────────────────────
+// Round drafts and placement claims are stored as documents in the `meta`
+// collection (meta/compileDraft_<id>, meta/compileClaim_<questionId>), which the
+// live security rules already let every approved member read and write (the
+// question-number counter lives there too). That way all users can work in
+// Compile without a rules change. Admin-only actions (creating, deleting and
+// reordering drafts) are limited by the app, not by the database.
+// Drafts saved before this lived in `compileDrafts`, which only admins can read;
+// migrateLegacyCompileDrafts() copies them over (see watchCompileDrafts).
+const META = 'meta';
+const draftRef = (id) => F.doc(db, META, 'compileDraft_' + id);
+const claimRef = (questionId) => F.doc(db, META, 'compileClaim_' + questionId);
+const draftsQuery = () => F.query(F.collection(db, META), F.where('kind', '==', 'compileDraft'));
+const draftFromDoc = (d) => ({ ...d.data(), id: d.data().draftId || d.id.replace(/^compileDraft_/, '') });
+
 // ── One round per question: placement claims ─────────────────────────────────
 // Before a question goes into a round draft, the person placing it claims it
 // (compileClaims/{questionId} → { draftId, at }). Claiming is atomic, so two
 // people can't both win the same question for different drafts, even within the
 // second before either draft saves. A claim lapses on its own once its draft no
-// longer holds the question: the draft is gone, or it saved since the claim
-// without the question (removed, cleared, graveyarded). A brand-new claim whose
-// draft hasn't saved yet stays valid for CLAIM_GRACE_MS.
+// longer holds the question: the draft is gone, or the person who claimed it
+// has saved that draft since without the question. A save by someone else
+// doesn't count — their copy may simply not include the new placement yet.
+// Removing a question from a draft releases its claim right away (see
+// releaseClaim); anything left over lapses after CLAIM_GRACE_MS.
 const CLAIM_GRACE_MS = 10 * 60 * 1000;
 function claimHolds(claim, draft, questionId) {
   if (!draft) return false;
   if ((draft.slots || []).some((s) => s.tu === questionId || s.b === questionId)) return true;
-  const savedSince = (draft.updatedAt || 0) > (claim.at || 0);
-  return !savedSince && now() - (claim.at || 0) < CLAIM_GRACE_MS;
+  const savedSinceByClaimer = (draft.updatedAt || 0) > (claim.at || 0) && !!claim.byUid && draft.updatedByUid === claim.byUid;
+  return !savedSinceByClaimer && now() - (claim.at || 0) < CLAIM_GRACE_MS;
 }
 
 // Resolves { ok: true } once `questionId` is claimed for `draftId`, or
 // { ok: false, draftName } if another draft holds it.
 export async function claimForDraft(questionId, draftId) {
   const u = requireUser();
-  const ref = F.doc(db, 'compileClaims', questionId);
+  const ref = claimRef(questionId);
   return F.runTransaction(db, async (tx) => {
     const snap = await tx.get(ref);
     if (snap.exists()) {
       const c = snap.data();
       if (c.draftId && c.draftId !== draftId) {
-        const dSnap = await tx.get(F.doc(db, 'compileDrafts', c.draftId));
+        const dSnap = await tx.get(draftRef(c.draftId));
         const draft = dSnap.exists() ? dSnap.data() : null;
         if (claimHolds(c, draft, questionId)) return { ok: false, draftName: draft.name || 'another draft' };
       }
     }
-    tx.set(ref, { draftId, at: now(), byUid: u.uid, byName: u.displayName || u.email });
+    tx.set(ref, { kind: 'compileClaim', questionId, draftId, at: now(), byUid: u.uid, byName: u.displayName || u.email });
     return { ok: true };
   });
 }
@@ -531,7 +549,7 @@ export async function claimForDraft(questionId, draftId) {
 // Drop this draft's claim on a question (best effort; claims also lapse alone).
 export async function releaseClaim(questionId, draftId) {
   try {
-    const ref = F.doc(db, 'compileClaims', questionId);
+    const ref = claimRef(questionId);
     await F.runTransaction(db, async (tx) => {
       const snap = await tx.get(ref);
       if (snap.exists() && snap.data().draftId === draftId) tx.delete(ref);
@@ -541,45 +559,81 @@ export async function releaseClaim(questionId, draftId) {
 
 export async function saveCompileDraft(draft) {
   const u = requireUser();
-  const { id } = draft;
-  const data = draftShape(u, draft, !id);
-  if (id) {
-    await F.setDoc(F.doc(db, 'compileDrafts', id), data, { merge: true });
-    return { id, ...data };
+  const isNew = !draft.id;
+  // A new draft gets a fresh id (generated locally; nothing is written there).
+  const id = draft.id || F.doc(F.collection(db, 'compileDrafts')).id;
+  const data = draftShape(u, draft, isNew);
+  data.kind = 'compileDraft';
+  data.draftId = id;
+  if (isNew) {
+    data.createdAt = now();
+    data.createdByUid = u.uid;
+    data.createdByName = u.displayName || u.email;
   }
-  data.createdAt = now();
-  data.createdByUid = u.uid;
-  data.createdByName = u.displayName || u.email;
-  const ref = await F.addDoc(F.collection(db, 'compileDrafts'), data);
-  return { id: ref.id, ...data };
+  await F.setDoc(draftRef(id), data, { merge: true });
+  return { id, ...data };
 }
 
 // Admin: save the shared draft order (ids first → last). Only `order` changes —
 // not updatedAt — so reordering never looks like an edit to a round's contents.
 export async function reorderCompileDrafts(ids) {
   const batch = F.writeBatch(db);
-  ids.forEach((id, i) => batch.update(F.doc(db, 'compileDrafts', id), { order: i }));
+  ids.forEach((id, i) => batch.update(draftRef(id), { order: i }));
   await batch.commit();
 }
 
 export async function deleteCompileDraft(id) {
-  await F.deleteDoc(F.doc(db, 'compileDrafts', id));
+  await F.deleteDoc(draftRef(id));
+}
+
+// Copy drafts saved in the old `compileDrafts` collection into `meta`, once
+// each (the old copy is flagged `migratedToMeta` so a later delete in `meta`
+// doesn't bring it back). Only admins can read `compileDrafts` under the live
+// rules, so for anyone else this is a quiet no-op; the first admin to open
+// Compile brings the existing drafts over for everyone.
+let _migration = null;
+function migrateLegacyCompileDrafts() {
+  if (!_migration) {
+    _migration = (async () => {
+      let snap;
+      try { snap = await F.getDocs(F.collection(db, 'compileDrafts')); }
+      catch { _migration = null; return; } // not allowed for this account — try again next time
+      for (const d of snap.docs) {
+        const data = d.data();
+        if (data.migratedToMeta) continue;
+        try {
+          const target = draftRef(d.id);
+          const existing = await F.getDoc(target);
+          if (!existing.exists()) await F.setDoc(target, { ...data, kind: 'compileDraft', draftId: d.id });
+          await F.updateDoc(d.ref, { migratedToMeta: true });
+        } catch (e) { console.error('migrate compile draft', d.id, e); }
+      }
+    })();
+  }
+  return _migration;
 }
 
 export function watchCompileDrafts(cb) {
   // Like watchQuestions: skip stale IndexedDB snapshots until the server confirms,
   // or Compile would load an old copy of the active draft (and autosave it back
   // over newer edits) or, on an empty cache, seed a spurious "Draft 1".
-  let synced = false;
-  return F.onSnapshot(F.query(F.collection(db, 'compileDrafts')), { includeMetadataChanges: true }, (snap) => {
-    if (!synced) {
-      if (snap.metadata.fromCache) return;
-      synced = true;
-    } else if (!snap.docChanges().length) return; // metadata-only (e.g. pending write acked)
-    const arr = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
-    arr.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
-    cb(arr);
-  }, (err) => { console.error('watchCompileDrafts', err); cb([]); });
+  // Old drafts are copied over first, so an admin never sees an empty list and
+  // seeds a new draft while the existing ones are still being moved.
+  let stop = null, cancelled = false;
+  migrateLegacyCompileDrafts().finally(() => {
+    if (cancelled) return;
+    let synced = false;
+    stop = F.onSnapshot(draftsQuery(), { includeMetadataChanges: true }, (snap) => {
+      if (!synced) {
+        if (snap.metadata.fromCache) return;
+        synced = true;
+      } else if (!snap.docChanges().length) return; // metadata-only (e.g. pending write acked)
+      const arr = snap.docs.map(draftFromDoc);
+      arr.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+      cb(arr);
+    }, (err) => { console.error('watchCompileDrafts', err); cb([]); });
+  });
+  return () => { cancelled = true; if (stop) stop(); };
 }
 
 export function watchOne(id, cb) {

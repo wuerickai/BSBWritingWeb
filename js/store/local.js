@@ -14,6 +14,7 @@ const K_QUESTIONS = 'sbq_questions';
 const K_SESSION = 'sbq_session';
 const K_COUNTER = 'sbq_counter';
 const K_COMPILE = 'sbq_compile_drafts';
+const K_CLAIMS = 'sbq_compile_claims';
 
 const read = (k, d) => { try { return JSON.parse(localStorage.getItem(k)) ?? d; } catch { return d; } };
 const write = (k, v) => localStorage.setItem(k, JSON.stringify(v));
@@ -255,6 +256,8 @@ export async function removeFromCompileDrafts(id) {
     names.push(d.name || 'Untitled draft');
   }
   if (names.length) { write(K_COMPILE, arr); emitCompile(); }
+  const claims = read(K_CLAIMS, {});
+  if (claims[id]) { delete claims[id]; write(K_CLAIMS, claims); }
   return names;
 }
 
@@ -460,18 +463,18 @@ export async function bulkUpsert(questions) {
 // (compileClaims/{questionId} → { draftId, at }). Claiming is atomic, so two
 // people can't both win the same question for different drafts, even within the
 // second before either draft saves. A claim lapses on its own once its draft no
-// longer holds the question: the draft is gone, or it saved since the claim
-// without the question (removed, cleared, graveyarded). A brand-new claim whose
-// draft hasn't saved yet stays valid for CLAIM_GRACE_MS.
+// longer holds the question: the draft is gone, or the person who claimed it
+// has saved that draft since without the question. A save by someone else
+// doesn't count — their copy may simply not include the new placement yet.
+// Removing a question from a draft releases its claim right away (see
+// releaseClaim); anything left over lapses after CLAIM_GRACE_MS.
 const CLAIM_GRACE_MS = 10 * 60 * 1000;
 function claimHolds(claim, draft, questionId) {
   if (!draft) return false;
   if ((draft.slots || []).some((s) => s.tu === questionId || s.b === questionId)) return true;
-  const savedSince = (draft.updatedAt || 0) > (claim.at || 0);
-  return !savedSince && now() - (claim.at || 0) < CLAIM_GRACE_MS;
+  const savedSinceByClaimer = (draft.updatedAt || 0) > (claim.at || 0) && !!claim.byUid && draft.updatedByUid === claim.byUid;
+  return !savedSinceByClaimer && now() - (claim.at || 0) < CLAIM_GRACE_MS;
 }
-const K_CLAIMS = 'sbq_compile_claims';
-
 export async function claimForDraft(questionId, draftId) {
   const u = requireUser();
   const claims = read(K_CLAIMS, {});

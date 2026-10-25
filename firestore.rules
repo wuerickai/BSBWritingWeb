@@ -113,10 +113,10 @@ service cloud.firestore {
           && resource.data.state == 'draft');
     }
 
-    // ── Compile round drafts (shared team artifact) ────────────────
-    // Every approved member can open the Compile view, read the round drafts and
-    // place / move questions in them. Only admins create or delete drafts, and
-    // only admins change their shared order.
+    // ── Compile round drafts: legacy location ──────────────────────
+    // Round drafts now live in `meta` (see below). This collection holds drafts
+    // saved before that move; the app copies them into `meta` once and flags the
+    // old copy `migratedToMeta`.
     match /compileDrafts/{id} {
       allow read: if isApproved();
       allow create, delete: if isAdmin();
@@ -125,14 +125,12 @@ service cloud.firestore {
             && !request.resource.data.diff(resource.data).affectedKeys().hasAny(['order']));
     }
 
-    // ── One round per question: placement claims ───────────────────
-    // compileClaims/{questionId} records which round draft holds a question, so
-    // two people can't place it into different rounds at the same moment.
-    match /compileClaims/{questionId} {
-      allow read, write: if isApproved();
-    }
-
-    // ── Sequential human-friendly ID counter ───────────────────────
+    // ── Shared app data: ID counter + Compile ──────────────────────
+    // meta/counters        — sequential human-friendly question IDs
+    // meta/compileDraft_*  — shared round drafts (Compile)
+    // meta/compileClaim_*  — which draft holds a question (one round per question)
+    // Every approved member can read and write these. Admin-only Compile actions
+    // (creating, deleting and reordering drafts) are enforced by the app.
     match /meta/{doc} {
       allow read, write: if isApproved();
     }

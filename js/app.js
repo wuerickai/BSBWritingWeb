@@ -2235,9 +2235,15 @@ function openPeerEditor(q) {
       if (isAdmin) await S().adminEdit(q.id, formatted);
       else await S().peerEdit(q.id, formatted);
       toast('Edits saved.', 'success'); m.close();
-    } catch (e) { console.error('peer edit', e); toast(explainError(e), 'error'); }
+    } catch (e) {
+      // The live database rules only let a question's author or an admin change
+      // its wording. Until they're updated, send the change to the author as a
+      // suggestion instead of losing it.
+      if (!isAdmin && e?.code === 'permission-denied') { await suggest({ fromSave: true }); return; }
+      console.error('peer edit', e); toast(explainError(e), 'error');
+    }
   };
-  const suggest = async () => {
+  const suggest = async ({ fromSave = false } = {}) => {
     const d = form.collect();
     const payload = suggestionPayload(q, {
       questionText: d.questionText,
@@ -2255,7 +2261,9 @@ function openPeerEditor(q) {
     if (!v.ok) { finish([v.errors[0]]); toast('Fix the LaTeX first.', 'error'); return; }
     try {
       await S().addSuggestion(q.id, payload);
-      toast(extra.length ? 'Suggestion sent. Changes to type/subject/category/source can’t go in a suggestion and were left out.' : 'Suggestion sent to the author for review.', extra.length ? 'warn' : 'success');
+      const parts = [fromSave ? 'Only the author or an admin can change this question directly right now, so your edit was sent to the author as a suggestion.' : 'Suggestion sent to the author for review.'];
+      if (extra.length) parts.push('Changes to type/subject/category/source can’t go in a suggestion and were left out.');
+      toast(parts.join(' '), extra.length || fromSave ? 'warn' : 'success');
       m.close();
     } catch (e) { console.error('suggest from editor', e); toast(explainError(e), 'error'); }
   };
@@ -2419,8 +2427,13 @@ function viewCompile() {
         slots: workingRows(),
         ...workingOpts(),
       };
+      // Questions this save takes out of the draft (✕, Clear, fewer pairs) give
+      // up their placement claim right away, so they can go into another round.
+      const kept = new Set(payload.slots.flatMap((sl) => [sl.tu, sl.b]).filter(Boolean));
+      const dropped = base ? [...new Set([...base.cells.values()].filter((v) => v && !kept.has(v)))] : [];
       base = snapshotOf(payload); // what everyone will see once this lands
       const saved = await S().saveCompileDraft(payload);
+      for (const qid of dropped) S().releaseClaim(qid, payload.id);
       // Update the draft that was SAVED — by the time the save returns, the person
       // may have switched tabs, and copying this onto the new active draft would
       // give it the old draft's id, name and questions on screen.
@@ -2966,8 +2979,10 @@ function viewCompile() {
   // enforces the same.
   const isAdminUser = app.user.role === 'admin';
   const sortedDrafts = () => [...drafts].sort((a, b) => {
-    const ao = Number.isFinite(a.order) ? a.order : Infinity;
-    const bo = Number.isFinite(b.order) ? b.order : Infinity;
+    // Drafts without a saved position (made before ordering existed) come first,
+    // oldest first; new drafts get max+1, so they land at the end.
+    const ao = Number.isFinite(a.order) ? a.order : -Infinity;
+    const bo = Number.isFinite(b.order) ? b.order : -Infinity;
     return ao !== bo ? ao - bo : (a.createdAt || 0) - (b.createdAt || 0);
   });
   const nextOrder = () => drafts.reduce((m, d) => (Number.isFinite(d.order) ? Math.max(m, d.order) : m), -1) + 1;
@@ -3143,7 +3158,7 @@ function viewCompile() {
     const render = () => {
       if (reorderActive) { redrawAfterDrag = true; return; } // don't rebuild under a drag
       clear(listHost);
-      if (!drafts.length) { listHost.appendChild(el('p', { class: 'muted sm', text: isAdminUser ? 'No drafts yet.' : 'No round drafts yet — an admin needs to create one.' })); return; }
+      if (!drafts.length) { listHost.appendChild(el('p', { class: 'muted sm', text: isAdminUser ? 'No drafts yet.' : 'No round drafts here yet — an admin needs to open Compile (or create one).' })); return; }
       if (isAdminUser) listHost.appendChild(el('p', { class: 'muted sm', style: 'margin:0 0 4px', text: 'Drag drafts (here or their tabs) to set the order everyone sees.' }));
       const clashes = draftClashCounts();
       for (const d of sortedDrafts()) {
@@ -3178,7 +3193,7 @@ function viewCompile() {
     clear(draftBar);
     draftBar.appendChild(el('span', { class: 'filter-label', text: 'Drafts' }));
     const tabs = el('div', { class: 'draft-tabs' });
-    if (draftsLoaded && !drafts.length && !isAdminUser) tabs.appendChild(el('span', { class: 'muted sm', text: 'No round drafts yet — an admin needs to create one.' }));
+    if (draftsLoaded && !drafts.length && !isAdminUser) tabs.appendChild(el('span', { class: 'muted sm', text: 'No round drafts here yet — an admin needs to open Compile (or create one).' }));
     for (const d of sortedDrafts().filter((x) => openIds.includes(x.id))) {
       const id = d.id;
       const isActive = id === activeId;
