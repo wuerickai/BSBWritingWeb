@@ -353,11 +353,7 @@ input[type=file].inp { padding: 8px; font-size: .85rem; }
 .draft-manager-row .grow { flex: 1; min-width: 0; }
 .draft-draggable { cursor: grab; touch-action: none; user-select: none; }
 body.is-reordering, body.is-reordering * { cursor: grabbing !important; }
-.draft-draggable.dragging { opacity: .45; }
-.draft-tab.drop-before { box-shadow: -3px 0 0 var(--primary); }
-.draft-tab.drop-after { box-shadow: 3px 0 0 var(--primary); }
-.draft-manager-row.drop-before { box-shadow: 0 -3px 0 var(--primary); }
-.draft-manager-row.drop-after { box-shadow: 0 3px 0 var(--primary); }
+.draft-draggable.dragging { opacity: .6; outline: 2px dashed var(--primary); outline-offset: 2px; position: relative; z-index: 2; }
 .draft-manager-row .drag-grip { color: var(--muted); cursor: grab; }
 .compile-toggles { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
 .compile-toggles .btn.active { background: var(--primary); border-color: var(--primary); color: #fff; }

@@ -2986,7 +2986,11 @@ function viewCompile() {
   // Make `node` draggable to reorder drafts (admins only). Uses pointer events
   // rather than native drag-and-drop, which won't start from the <button>s these
   // tabs/rows are made of in every browser. A press that moves less than a few
-  // pixels stays a normal click. `horizontal`: tabs drop left/right, rows above/below.
+  // pixels stays a normal click. While dragging, the other drafts slide aside
+  // live to show where it will land; letting go saves that order (Esc or a
+  // cancelled pointer puts everything back). `horizontal`: tabs vs. rows.
+  let reorderActive = false;   // a drag is in progress — hold off redraws
+  let redrawAfterDrag = false; // a redraw arrived mid-drag; run it on release
   const makeDraftDraggable = (node, id, horizontal) => {
     if (!isAdminUser) return node;
     node.classList.add('draft-draggable');
@@ -2994,37 +2998,88 @@ function viewCompile() {
     node.addEventListener('pointerdown', (down) => {
       if (down.button !== 0 || down.target.closest('.draft-tab-x, .row-end')) return; // ✕ and row buttons stay plain clicks
       const container = node.parentElement;
-      let dragging = false, over = null, after = false;
-      const clearMarks = () => container.querySelectorAll('.drop-before, .drop-after').forEach((n) => n.classList.remove('drop-before', 'drop-after'));
+      const items = () => [...container.children].filter((n) => n.dataset.draftId);
+      const startOrder = items();
+      let dragging = false;
+      // Where an element sits in the layout, ignoring the slide animation's
+      // transform (getBoundingClientRect would include it).
+      const layoutBox = (n) => {
+        const op = n.offsetParent;
+        const pr = op ? op.getBoundingClientRect() : { left: 0, top: 0 };
+        const left = pr.left + n.offsetLeft - (op ? op.scrollLeft - op.clientLeft : 0);
+        const top = pr.top + n.offsetTop - (op ? op.scrollTop - op.clientTop : 0);
+        return { left, top, right: left + n.offsetWidth, bottom: top + n.offsetHeight };
+      };
+      // How many of the other drafts come before the pointer. Tabs can wrap onto
+      // several lines, so a tab on an earlier line counts as before. This is
+      // stable: moving the dragged draft past one only pushes it further away.
+      const targetIndex = (x, y) => {
+        let i = 0;
+        for (const n of items()) {
+          if (n === node) continue;
+          const b = layoutBox(n);
+          const before = horizontal
+            ? (y >= b.bottom || (y >= b.top && x > (b.left + b.right) / 2))
+            : y > (b.top + b.bottom) / 2;
+          if (before) i++;
+        }
+        return i;
+      };
+      // Move `node` to position `i` among the others, then slide each sibling from
+      // where it was to its new spot (FLIP).
+      const placeAt = (i) => {
+        const others = items().filter((n) => n !== node);
+        if (items().indexOf(node) === i) return;
+        const old = new Map(others.map((n) => [n, n.getBoundingClientRect()]));
+        container.insertBefore(node, others[i] || null);
+        for (const n of others) {
+          const a = old.get(n), b = n.getBoundingClientRect();
+          const dx = a.left - b.left, dy = a.top - b.top;
+          if (dx || dy) n.animate([{ transform: `translate(${dx}px, ${dy}px)` }, { transform: 'none' }], { duration: 160, easing: 'ease-out' });
+        }
+      };
       const move = (e) => {
         if (!dragging) {
           if (Math.hypot(e.clientX - down.clientX, e.clientY - down.clientY) < 5) return;
-          dragging = true; node.classList.add('dragging'); document.body.classList.add('is-reordering');
+          dragging = true; reorderActive = true;
+          node.classList.add('dragging'); document.body.classList.add('is-reordering');
         }
         e.preventDefault();
-        const hit = document.elementFromPoint(e.clientX, e.clientY)?.closest('[data-draft-id]');
-        clearMarks(); over = null;
-        if (!hit || hit === node || hit.parentElement !== container) return;
-        const r = hit.getBoundingClientRect();
-        after = horizontal ? e.clientX > r.left + r.width / 2 : e.clientY > r.top + r.height / 2;
-        hit.classList.add(after ? 'drop-after' : 'drop-before');
-        over = hit.dataset.draftId;
+        placeAt(targetIndex(e.clientX, e.clientY));
       };
-      const up = () => {
+      const finish = (commit) => {
         document.removeEventListener('pointermove', move);
-        document.removeEventListener('pointerup', up);
-        document.removeEventListener('pointercancel', up);
+        document.removeEventListener('pointerup', onUp);
+        document.removeEventListener('pointercancel', onCancel);
+        document.removeEventListener('keydown', onKey);
         if (!dragging) return;
-        node.classList.remove('dragging'); document.body.classList.remove('is-reordering'); clearMarks();
+        reorderActive = false;
+        node.classList.remove('dragging'); document.body.classList.remove('is-reordering');
         // Swallow the click that follows a drag so it doesn't also switch tabs.
         const swallow = (ev) => { ev.stopPropagation(); ev.preventDefault(); };
         window.addEventListener('click', swallow, { capture: true, once: true });
         setTimeout(() => window.removeEventListener('click', swallow, { capture: true }), 0);
-        if (over) moveDraft(id, over, after);
+        const now = items();
+        const changed = now.some((n, i) => n !== startOrder[i]);
+        if (commit && changed) {
+          // Place it next to its new neighbour in the full shared order (the tab
+          // bar shows only open drafts, so neighbours there may not be adjacent).
+          const i = now.indexOf(node);
+          if (now[i + 1]) moveDraft(id, now[i + 1].dataset.draftId, false);
+          else if (now[i - 1]) moveDraft(id, now[i - 1].dataset.draftId, true);
+          redrawAfterDrag = false;
+          return;
+        }
+        if (!commit && changed) for (const n of startOrder) container.appendChild(n); // put it back
+        if (redrawAfterDrag) { redrawAfterDrag = false; drawDraftBar(); refreshManager?.(); }
       };
+      const onUp = (e) => { if (dragging) placeAt(targetIndex(e.clientX, e.clientY)); finish(true); };
+      const onCancel = () => finish(false);
+      const onKey = (e) => { if (e.key === 'Escape') { e.stopPropagation(); finish(false); } };
       document.addEventListener('pointermove', move);
-      document.addEventListener('pointerup', up);
-      document.addEventListener('pointercancel', up);
+      document.addEventListener('pointerup', onUp);
+      document.addEventListener('pointercancel', onCancel);
+      document.addEventListener('keydown', onKey, true);
     });
     return node;
   };
@@ -3086,6 +3141,7 @@ function viewCompile() {
   const openDraftManager = () => {
     const listHost = el('div', { class: 'draft-manager' });
     const render = () => {
+      if (reorderActive) { redrawAfterDrag = true; return; } // don't rebuild under a drag
       clear(listHost);
       if (!drafts.length) { listHost.appendChild(el('p', { class: 'muted sm', text: isAdminUser ? 'No drafts yet.' : 'No round drafts yet — an admin needs to create one.' })); return; }
       if (isAdminUser) listHost.appendChild(el('p', { class: 'muted sm', style: 'margin:0 0 4px', text: 'Drag drafts (here or their tabs) to set the order everyone sees.' }));
@@ -3118,6 +3174,7 @@ function viewCompile() {
   };
 
   function drawDraftBar() {
+    if (reorderActive) { redrawAfterDrag = true; return; } // don't rebuild under a drag
     clear(draftBar);
     draftBar.appendChild(el('span', { class: 'filter-label', text: 'Drafts' }));
     const tabs = el('div', { class: 'draft-tabs' });
