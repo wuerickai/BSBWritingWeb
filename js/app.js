@@ -2421,7 +2421,10 @@ function viewCompile() {
       };
       base = snapshotOf(payload); // what everyone will see once this lands
       const saved = await S().saveCompileDraft(payload);
-      const cur = getDraft(activeId);
+      // Update the draft that was SAVED — by the time the save returns, the person
+      // may have switched tabs, and copying this onto the new active draft would
+      // give it the old draft's id, name and questions on screen.
+      const cur = getDraft(payload.id);
       if (cur) Object.assign(cur, saved); // keep the local snapshot fresh (updatedAt)
     } catch (e) { console.error('saveCompileDraft', e); toast('Couldn’t save the draft.', 'warn'); }
   };
@@ -2564,6 +2567,7 @@ function viewCompile() {
 
   // Why `q` can't go into this round right now, or null if it can.
   const placeBlocker = (q) => {
+    if (draftsLoaded && !drafts.length) return 'There’s no round draft yet — an admin needs to create one.';
     if (!draftsLoaded || loadedWorkingId !== activeId) return 'Still loading round drafts — try again in a moment.';
     if (usedIds().has(q.id)) return 'That question is already in the round.';
     const elsewhere = otherDraftUse().get(q.id);
@@ -2956,17 +2960,88 @@ function viewCompile() {
     if (refresh) refreshManager?.();
   };
 
+  // ── Shared draft order ──
+  // Drafts carry an `order` number that everyone sees (tabs and the Manage list
+  // follow it). Only admins create, delete or reorder drafts — firestore.rules
+  // enforces the same.
+  const isAdminUser = app.user.role === 'admin';
+  const sortedDrafts = () => [...drafts].sort((a, b) => {
+    const ao = Number.isFinite(a.order) ? a.order : Infinity;
+    const bo = Number.isFinite(b.order) ? b.order : Infinity;
+    return ao !== bo ? ao - bo : (a.createdAt || 0) - (b.createdAt || 0);
+  });
+  const nextOrder = () => drafts.reduce((m, d) => (Number.isFinite(d.order) ? Math.max(m, d.order) : m), -1) + 1;
+  // Move draft `dragId` to just before/after `targetId`, then save the order.
+  const moveDraft = async (dragId, targetId, after) => {
+    if (!isAdminUser || dragId === targetId) return;
+    const ids = sortedDrafts().map((d) => d.id).filter((id) => id !== dragId);
+    const at = ids.indexOf(targetId);
+    if (at < 0) return;
+    ids.splice(after ? at + 1 : at, 0, dragId);
+    ids.forEach((id, i) => { const d = getDraft(id); if (d) d.order = i; }); // optimistic
+    drawDraftBar(); refreshManager?.();
+    try { await S().reorderCompileDrafts(ids); }
+    catch (e) { console.error('reorder drafts', e); toast('Couldn’t save the new order: ' + explainError(e), 'warn'); }
+  };
+  // Make `node` draggable to reorder drafts (admins only). Uses pointer events
+  // rather than native drag-and-drop, which won't start from the <button>s these
+  // tabs/rows are made of in every browser. A press that moves less than a few
+  // pixels stays a normal click. `horizontal`: tabs drop left/right, rows above/below.
+  const makeDraftDraggable = (node, id, horizontal) => {
+    if (!isAdminUser) return node;
+    node.classList.add('draft-draggable');
+    node.dataset.draftId = id;
+    node.addEventListener('pointerdown', (down) => {
+      if (down.button !== 0 || down.target.closest('.draft-tab-x, .row-end')) return; // ✕ and row buttons stay plain clicks
+      const container = node.parentElement;
+      let dragging = false, over = null, after = false;
+      const clearMarks = () => container.querySelectorAll('.drop-before, .drop-after').forEach((n) => n.classList.remove('drop-before', 'drop-after'));
+      const move = (e) => {
+        if (!dragging) {
+          if (Math.hypot(e.clientX - down.clientX, e.clientY - down.clientY) < 5) return;
+          dragging = true; node.classList.add('dragging'); document.body.classList.add('is-reordering');
+        }
+        e.preventDefault();
+        const hit = document.elementFromPoint(e.clientX, e.clientY)?.closest('[data-draft-id]');
+        clearMarks(); over = null;
+        if (!hit || hit === node || hit.parentElement !== container) return;
+        const r = hit.getBoundingClientRect();
+        after = horizontal ? e.clientX > r.left + r.width / 2 : e.clientY > r.top + r.height / 2;
+        hit.classList.add(after ? 'drop-after' : 'drop-before');
+        over = hit.dataset.draftId;
+      };
+      const up = () => {
+        document.removeEventListener('pointermove', move);
+        document.removeEventListener('pointerup', up);
+        document.removeEventListener('pointercancel', up);
+        if (!dragging) return;
+        node.classList.remove('dragging'); document.body.classList.remove('is-reordering'); clearMarks();
+        // Swallow the click that follows a drag so it doesn't also switch tabs.
+        const swallow = (ev) => { ev.stopPropagation(); ev.preventDefault(); };
+        window.addEventListener('click', swallow, { capture: true, once: true });
+        setTimeout(() => window.removeEventListener('click', swallow, { capture: true }), 0);
+        if (over) moveDraft(id, over, after);
+      };
+      document.addEventListener('pointermove', move);
+      document.addEventListener('pointerup', up);
+      document.addEventListener('pointercancel', up);
+    });
+    return node;
+  };
+
   const newDraft = async () => {
+    if (!isAdminUser) { toast('Only admins can create round drafts.', 'warn'); return; }
     const name = await promptDialog('Name this draft', { value: 'Draft ' + (drafts.length + 1), confirmText: 'Create' });
     if (!name) return;
-    await openSavedDraft(newDraftState(name), true);
+    await openSavedDraft({ ...newDraftState(name), order: nextOrder() }, true);
   };
 
   const duplicateDraft = (id) => {
+    if (!isAdminUser) { toast('Only admins can create round drafts.', 'warn'); return; }
     const src = getDraft(id); if (!src) return;
     // Questions can only live in one draft, so the copy keeps the composition and
     // export options but starts with empty slots.
-    openSavedDraft(newDraftState('Copy of ' + src.name, { ...src, slots: [] }), true);
+    openSavedDraft({ ...newDraftState('Copy of ' + src.name, { ...src, slots: [] }), order: nextOrder() }, true);
     toast('Duplicated the layout — questions stay in the original draft.');
   };
 
@@ -2991,15 +3066,15 @@ function viewCompile() {
   };
 
   const deleteDraft = async (id) => {
-    const d = getDraft(id); if (!d) return false;
+    const d = getDraft(id); if (!d || !isAdminUser) return false;
     if (!(await confirmDialog(`Delete draft “${d.name}”? This deletes it for everyone and can’t be undone.`, { danger: true, confirmText: 'Delete' }))) return false;
     try { await S().deleteCompileDraft(id); }
     catch (e) { console.error('delete draft', e); toast('Couldn’t delete the draft.', 'warn'); return false; }
     drafts = drafts.filter((x) => x.id !== id);
     openIds = openIds.filter((x) => x !== id);
-    if (!drafts.length) { activeId = null; openIds = []; saveUi(); await openSavedDraft(newDraftState('Draft 1'), true); return true; }
+    if (!drafts.length) { activeId = null; openIds = []; saveUi(); await openSavedDraft({ ...newDraftState('Draft 1'), order: 0 }, true); return true; }
     if (activeId === id) {
-      activeId = openIds[0] || drafts[0].id;
+      activeId = openIds[0] || sortedDrafts()[0].id;
       if (!openIds.includes(activeId)) openIds.push(activeId);
       saveUi();
       loadWorkingFromDraft(activeId);
@@ -3012,15 +3087,16 @@ function viewCompile() {
     const listHost = el('div', { class: 'draft-manager' });
     const render = () => {
       clear(listHost);
-      if (!drafts.length) { listHost.appendChild(el('p', { class: 'muted sm', text: 'No drafts yet.' })); return; }
-      const sorted = [...drafts].sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+      if (!drafts.length) { listHost.appendChild(el('p', { class: 'muted sm', text: isAdminUser ? 'No drafts yet.' : 'No round drafts yet — an admin needs to create one.' })); return; }
+      if (isAdminUser) listHost.appendChild(el('p', { class: 'muted sm', style: 'margin:0 0 4px', text: 'Drag drafts (here or their tabs) to set the order everyone sees.' }));
       const clashes = draftClashCounts();
-      for (const d of sorted) {
+      for (const d of sortedDrafts()) {
         const isOpen = openIds.includes(d.id);
         const isActive = d.id === activeId;
         const filled = (d.slots || []).reduce((n, s) => n + (s.tu ? 1 : 0) + (s.b ? 1 : 0), 0);
         const by = d.updatedByName ? ` · by ${d.updatedByName}` : '';
-        listHost.appendChild(el('div', { class: 'draft-manager-row' + (isActive ? ' active' : '') }, [
+        listHost.appendChild(makeDraftDraggable(el('div', { class: 'draft-manager-row' + (isActive ? ' active' : '') }, [
+          isAdminUser ? el('span', { class: 'drag-grip', text: '⠿', title: 'Drag to reorder' }) : null,
           el('div', { class: 'grow' }, [
             el('strong', { text: d.name }),
             isActive ? el('span', { class: 'chip', style: 'margin-left:8px', text: 'active' }) : (isOpen ? el('span', { class: 'chip subtle', style: 'margin-left:8px', text: 'open' }) : null),
@@ -3030,10 +3106,10 @@ function viewCompile() {
           el('div', { class: 'row-end gap' }, [
             el('button', { class: 'btn ' + (isActive ? 'ghost' : 'primary') + ' sm', text: isActive ? 'Active' : (isOpen ? 'Switch to' : 'Open'), disabled: isActive, onclick: () => loadDraft(d.id) }),
             el('button', { class: 'btn ghost sm', text: 'Rename', onclick: () => renameDraft(d.id) }),
-            el('button', { class: 'btn ghost sm', text: 'Duplicate', onclick: () => duplicateDraft(d.id) }),
-            app.user.role === 'admin' ? el('button', { class: 'btn danger sm', text: 'Delete', onclick: () => deleteDraft(d.id) }) : null,
+            isAdminUser ? el('button', { class: 'btn ghost sm', text: 'Duplicate', onclick: () => duplicateDraft(d.id) }) : null,
+            isAdminUser ? el('button', { class: 'btn danger sm', text: 'Delete', onclick: () => deleteDraft(d.id) }) : null,
           ]),
-        ]));
+        ]), d.id, false));
       }
     };
     render();
@@ -3045,19 +3121,20 @@ function viewCompile() {
     clear(draftBar);
     draftBar.appendChild(el('span', { class: 'filter-label', text: 'Drafts' }));
     const tabs = el('div', { class: 'draft-tabs' });
-    for (const id of openIds) {
-      const d = getDraft(id); if (!d) continue;
+    if (draftsLoaded && !drafts.length && !isAdminUser) tabs.appendChild(el('span', { class: 'muted sm', text: 'No round drafts yet — an admin needs to create one.' }));
+    for (const d of sortedDrafts().filter((x) => openIds.includes(x.id))) {
+      const id = d.id;
       const isActive = id === activeId;
-      tabs.appendChild(el('div', { class: 'draft-tab' + (isActive ? ' active' : '') }, [
+      tabs.appendChild(makeDraftDraggable(el('div', { class: 'draft-tab' + (isActive ? ' active' : ''), title: isAdminUser ? 'Drag to reorder' : '' }, [
         // The first click of a double-click switches tabs and rebuilds this bar, so
         // `dblclick` never reaches the new button; read the click count instead.
         el('button', { class: 'draft-tab-name', text: d.name, title: 'Updated ' + fmtDate(d.updatedAt) + ' · double-click to rename', onclick: (e) => (e.detail === 2 ? renameDraft(id) : loadDraft(id)) }),
         el('button', { class: 'draft-tab-x', text: '✕', title: 'Close tab (the draft is kept)', onclick: (e) => { e.stopPropagation(); closeDraftTab(id); } }),
-      ]));
+      ]), id, true));
     }
     draftBar.appendChild(tabs);
-    draftBar.appendChild(el('button', { class: 'btn ghost sm', text: '+ New', title: 'Start a new round draft', onclick: newDraft }));
-    draftBar.appendChild(el('button', { class: 'btn ghost sm', text: '⋯ Manage', title: 'Open, rename, duplicate or delete saved drafts', onclick: openDraftManager }));
+    if (isAdminUser) draftBar.appendChild(el('button', { class: 'btn ghost sm', text: '+ New', title: 'Start a new round draft', onclick: newDraft }));
+    draftBar.appendChild(el('button', { class: 'btn ghost sm', text: '⋯ Manage', title: isAdminUser ? 'Open, rename, reorder, duplicate or delete round drafts' : 'Open or rename round drafts', onclick: openDraftManager }));
   }
 
   // Reconcile the live shared draft list into local UI state. Keeps the active
@@ -3066,15 +3143,21 @@ function viewCompile() {
     drafts = rows;
     draftsLoaded = true;
     if (!rows.length) {
+      if (!isAdminUser) {
+        // Only admins create drafts; show the empty state until one exists.
+        activeId = null; loadedWorkingId = null; openIds = [];
+        buildSlots(false); drawDraftBar(); refreshManager?.(); drawAll();
+        return;
+      }
       if (creatingSeed) return;
       creatingSeed = true;
       const migrated = await migrateLegacyDrafts();
-      if (!migrated) { try { await S().saveCompileDraft(newDraftState('Draft 1')); } catch (e) { console.error('seed draft', e); } }
+      if (!migrated) { try { await S().saveCompileDraft({ ...newDraftState('Draft 1'), order: 0 }); } catch (e) { console.error('seed draft', e); } }
       creatingSeed = false;
       return; // the next snapshot carries the created draft(s)
     }
     openIds = openIds.filter((id) => drafts.some((d) => d.id === id));
-    if (!openIds.length) openIds = [drafts[0].id];
+    if (!openIds.length) openIds = [sortedDrafts()[0].id];
     if (!openIds.includes(activeId)) activeId = openIds[0];
     saveUi();
     if (loadedWorkingId !== activeId) loadWorkingFromDraft(activeId);

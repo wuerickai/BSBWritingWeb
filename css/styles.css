@@ -351,6 +351,14 @@ input[type=file].inp { padding: 8px; font-size: .85rem; }
 .draft-manager-row { display: flex; align-items: center; gap: 12px; padding: 10px 12px; border: 1px solid var(--line); border-radius: var(--radius-sm); background: var(--bg-2); }
 .draft-manager-row.active { border-color: var(--primary); }
 .draft-manager-row .grow { flex: 1; min-width: 0; }
+.draft-draggable { cursor: grab; touch-action: none; user-select: none; }
+body.is-reordering, body.is-reordering * { cursor: grabbing !important; }
+.draft-draggable.dragging { opacity: .45; }
+.draft-tab.drop-before { box-shadow: -3px 0 0 var(--primary); }
+.draft-tab.drop-after { box-shadow: 3px 0 0 var(--primary); }
+.draft-manager-row.drop-before { box-shadow: 0 -3px 0 var(--primary); }
+.draft-manager-row.drop-after { box-shadow: 0 3px 0 var(--primary); }
+.draft-manager-row .drag-grip { color: var(--muted); cursor: grab; }
 .compile-toggles { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
 .compile-toggles .btn.active { background: var(--primary); border-color: var(--primary); color: #fff; }
 .compile-split { display: flex; align-items: stretch; gap: 0; min-height: 60vh; }

@@ -501,6 +501,7 @@ export async function saveCompileDraft(draft) {
     if (isNew || draft[k] !== undefined) data[k] = draft[k] || dflt;
   }
   for (const k of ['shuffle', 'fullDoc']) if (isNew || draft[k] !== undefined) data[k] = draft[k] !== false;
+  if (Number.isFinite(draft.order)) data.order = draft.order;
   Object.assign(data, { updatedAt: now(), updatedByUid: u.uid, updatedByName: u.displayName || u.email });
   let rec;
   if (existing) { Object.assign(existing, data); rec = existing; }
@@ -511,6 +512,14 @@ export async function saveCompileDraft(draft) {
   write(K_COMPILE, arr);
   emitCompile();
   return { ...rec };
+}
+
+// Admin: save the shared draft order (mirrors firebase.js; doesn't touch updatedAt).
+export async function reorderCompileDrafts(ids) {
+  const arr = read(K_COMPILE, []);
+  ids.forEach((id, i) => { const d = arr.find((x) => x.id === id); if (d) d.order = i; });
+  write(K_COMPILE, arr);
+  emitCompile();
 }
 
 export async function deleteCompileDraft(id) {

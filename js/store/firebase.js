@@ -485,6 +485,7 @@ function draftShape(u, data, isNew) {
   for (const k of ['shuffle', 'fullDoc']) {
     if (isNew || data[k] !== undefined) out[k] = data[k] !== false;
   }
+  if (Number.isFinite(data.order)) out.order = data.order; // shared position (admins set it)
   out.updatedAt = now();
   out.updatedByUid = u.uid;
   out.updatedByName = u.displayName || u.email;
@@ -551,6 +552,14 @@ export async function saveCompileDraft(draft) {
   data.createdByName = u.displayName || u.email;
   const ref = await F.addDoc(F.collection(db, 'compileDrafts'), data);
   return { id: ref.id, ...data };
+}
+
+// Admin: save the shared draft order (ids first → last). Only `order` changes —
+// not updatedAt — so reordering never looks like an edit to a round's contents.
+export async function reorderCompileDrafts(ids) {
+  const batch = F.writeBatch(db);
+  ids.forEach((id, i) => batch.update(F.doc(db, 'compileDrafts', id), { order: i }));
+  await batch.commit();
 }
 
 export async function deleteCompileDraft(id) {

@@ -114,12 +114,15 @@ service cloud.firestore {
     }
 
     // ── Compile round drafts (shared team artifact) ────────────────
-    // Every approved member can open the Compile view, read the round drafts,
-    // create new ones and place / move questions in them. Deleting a draft
-    // (which removes it for everyone) stays admin-only.
+    // Every approved member can open the Compile view, read the round drafts and
+    // place / move questions in them. Only admins create or delete drafts, and
+    // only admins change their shared order.
     match /compileDrafts/{id} {
-      allow read, create, update: if isApproved();
-      allow delete: if isAdmin();
+      allow read: if isApproved();
+      allow create, delete: if isAdmin();
+      allow update: if isAdmin()
+        || (isApproved()
+            && !request.resource.data.diff(resource.data).affectedKeys().hasAny(['order']));
     }
 
     // ── One round per question: placement claims ───────────────────
