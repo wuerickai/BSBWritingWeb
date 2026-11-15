@@ -51,6 +51,7 @@ const HEADER_ALIASES = {
   id: ['id'],
   source: ['source'],
   writerInitials: ['writerinitials', 'initials', 'writer'],
+  imageUrl: ['imagelink', 'imageurl', 'image', 'slideslink'],
 };
 
 function buildHeaderMap(headerRow) {
@@ -97,6 +98,7 @@ export function csvToQuestions(text) {
       difficulty: intOrNull(get(row, 'difficulty')),
       source: get(row, 'source'),
       writerInitials: get(row, 'writerInitials').toUpperCase(),
+      imageUrl: get(row, 'imageUrl'),
       csvId: intOrNull(get(row, 'id')),
       _rowNum: r + 1,
     });

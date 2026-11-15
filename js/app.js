@@ -444,13 +444,28 @@ function buildQuestionForm(initial = {}) {
   fillSelect(mcAnswer, T.MC_SLOTS, { selected: initial.mcAnswer, placeholder: 'Which choice is correct?' });
   const mcWrap = el('div', { class: 'subsection' }, [el('h4', { text: 'Choices' }), mcRows, field('Correct answer (MC)', mcAnswer)]);
 
+  // Visual Bonus: image link (Google Slides). Shown only for VB, which is always SA.
+  const imageUrl = el('input', { class: 'inp', value: initial.imageUrl || '', placeholder: 'https://docs.google.com/presentation/d/…' });
+  const vbWrap = el('div', { class: 'subsection' }, [
+    field('Image link (Google Slides)', imageUrl),
+    el('div', { class: 'muted sm', text: 'Write every part (1., 2., …) in the question text, and the answers to every part in the answer line.' }),
+  ]);
+
   const setType = () => {
     const t = type.value;
     saWrap.style.display = t === 'SA' ? '' : 'none';
     mcWrap.style.display = t === 'MC' ? '' : 'none';
   };
+  const setTub = () => {
+    const vb = tub.value === 'VB';
+    vbWrap.style.display = vb ? '' : 'none';
+    if (vb) { type.value = 'SA'; setType(); }
+    type.disabled = vb;
+  };
   type.addEventListener('change', setType);
+  tub.addEventListener('change', setTub);
   setType();
+  setTub();
 
   // Live previews + validation.
   const showVal = () => {
@@ -496,7 +511,7 @@ function buildQuestionForm(initial = {}) {
     field('Question text', qText),
     el('div', { class: 'preview-wrap' }, [el('div', { class: 'preview-label', text: 'Live preview' }), qPreview, qStatus]),
     dupHost,
-    saWrap, mcWrap,
+    vbWrap, saWrap, mcWrap,
     el('div', { class: 'grid-3' }, [
       field('Difficulty', difficulty), field('Writer name', writerName), field('Writer initials', writerInitials),
     ]),
@@ -510,6 +525,7 @@ function buildQuestionForm(initial = {}) {
     mcAnswer: mcAnswer.value,
     difficulty: difficulty.value ? Number(difficulty.value) : null,
     source: source.value, writerName: writerName.value, writerInitials: writerInitials.value,
+    imageUrl: tub.value === 'VB' ? imageUrl.value.trim() : '',
   });
 
   // Push field values into the live form (used to merge an accepted suggestion
@@ -538,10 +554,12 @@ function labeled(label, node) {
 // Required-field + LaTeX validation. Returns array of error strings.
 function validateForm(d) {
   const errors = [];
-  if (!d.tub) errors.push('Choose Toss-Up or Bonus.');
+  if (!d.tub) errors.push('Choose Toss-Up, Bonus or Visual Bonus.');
   if (!d.subject) errors.push('Choose a subject.');
   if (!d.subcat) errors.push('Choose a subcategory.');
   if (!d.type) errors.push('Choose a type (MC or SA).');
+  if (d.tub === 'VB' && d.type !== 'SA') errors.push('A Visual Bonus must be Short Answer.');
+  if (d.tub === 'VB' && !T.isGoogleSlidesLink(d.imageUrl)) errors.push('Add a Google Slides link (https://docs.google.com/presentation/…) for the Visual Bonus image.');
   if (!d.difficulty) errors.push('Choose a difficulty.');
   if (!d.questionText.trim()) errors.push('Question text is empty.');
   if (d.type === 'SA' && !d.answerLine.trim()) errors.push('Provide an answer line.');
@@ -838,6 +856,10 @@ function questionDetail(q) {
 
   const children = [
     meta,
+    q.tub === 'VB' ? el('div', { class: 'answer-line' }, [
+      el('span', { class: 'answer-key', text: 'Image:' }),
+      T.isGoogleSlidesLink(q.imageUrl) ? el('a', { href: q.imageUrl.trim(), target: '_blank', rel: 'noopener', text: 'Open Google Slides ↗' }) : el('span', { class: 'muted', text: 'No link yet' }),
+    ]) : null,
     el('h4', { text: 'Question' }), qBody,
     el('h4', { text: q.type === 'MC' ? 'Choices' : 'Answer' }), answerBlock,
   ];
@@ -1198,6 +1220,8 @@ function myCard(q) {
     actions.appendChild(el('button', { class: 'btn danger sm', text: 'Delete', onclick: async () => { if (await confirmDialog('Delete this draft?', { danger: true, confirmText: 'Delete' })) { const res = await S().deleteQuestion(q.id); toast('Draft deleted.' + roundsNote(res)); } } }));
   } else if (q.state === 'in_review') {
     actions.appendChild(el('button', { class: 'btn primary sm', text: pend > 0 ? 'Edit & resolve suggestions' : 'Edit', onclick: () => openEditor(q) }));
+  } else if (q.state === 'finalized') {
+    actions.appendChild(el('button', { class: 'btn primary sm', text: 'Edit', title: 'Edit — it stays finalized', onclick: () => editFromCompile(q) }));
   }
   actions.appendChild(el('button', { class: 'btn ghost sm', text: 'View', onclick: () => openMyQuestion(q) }));
   // Take an unfinished question out of the pipeline (kept in the Graveyard).
@@ -1663,7 +1687,7 @@ function renderTable(host, rows) {
       el('td', { class: 'q-cell', text: text + (q.questionText && q.questionText.length > 90 ? '…' : '') }),
       el('td', { class: 'nowrap-sm' }, [
         el('button', { class: 'btn ghost xs', text: 'View', onclick: () => modal(`Question #${q.humanId}`, questionDetail(q), { wide: true }) }),
-        app.user.role === 'admin' ? el('button', { class: 'btn ghost xs', text: 'Edit', style: 'margin-left:6px', onclick: () => openAdminEditor(q) }) : null,
+        el('button', { class: 'btn ghost xs', text: 'Edit', style: 'margin-left:6px', onclick: () => editFromCompile(q) }),
         app.user.role === 'admin' ? el('button', { class: 'btn ghost xs', text: 'Unfinalize', style: 'margin-left:6px', title: 'Send back to the review queue', onclick: () => unfinalizeDialog(q) }) : null,
         app.user.role === 'admin' ? el('button', { class: 'btn danger xs', text: 'Remove', style: 'margin-left:6px', title: 'Move to the Graveyard (kept, not deleted)', onclick: () => archiveDialog(q) }) : null,
       ]),
@@ -1678,14 +1702,14 @@ function csvEscape(v) {
   return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
 }
 function downloadCsv(rows, filename = 'finalized-questions.csv') {
-  const headers = ['TU/B', 'Subject', 'Type', 'Subcat', 'Question Text', 'IF SA - Answer Line', 'W', 'X', 'Y', 'Z', 'IF MC - Answer', 'IF MC - Answer Text', 'Difficulty', 'Status', 'ID', 'Source', 'Writer Initials'];
+  const headers = ['TU/B', 'Subject', 'Type', 'Subcat', 'Question Text', 'IF SA - Answer Line', 'W', 'X', 'Y', 'Z', 'IF MC - Answer', 'IF MC - Answer Text', 'Difficulty', 'Status', 'ID', 'Source', 'Writer Initials', 'Image Link'];
   const lines = [headers.join(',')];
   for (const q of rows) {
     // The ALL-CAPS answer-key reading of the correct choice (falls back to a live
     // computation for records saved before mcAnswerText existed).
     const mcAnswerText = q.type === 'MC'
       ? (q.mcAnswerText || allCapsPreservingLatex(q.choices?.[q.mcAnswer] || '')) : '';
-    lines.push([q.tub, q.subject, q.type, q.subcat, q.questionText, q.type === 'SA' ? q.answerLine : '', q.choices?.W, q.choices?.X, q.choices?.Y, q.choices?.Z, q.type === 'MC' ? q.mcAnswer : '', mcAnswerText, q.difficulty, q.status, q.humanId, q.source, q.writerInitials].map(csvEscape).join(','));
+    lines.push([q.tub, q.subject, q.type, q.subcat, q.questionText, q.type === 'SA' ? q.answerLine : '', q.choices?.W, q.choices?.X, q.choices?.Y, q.choices?.Z, q.type === 'MC' ? q.mcAnswer : '', mcAnswerText, q.difficulty, q.status, q.humanId, q.source, q.writerInitials, q.imageUrl || ''].map(csvEscape).join(','));
   }
   triggerDownload(new Blob([lines.join('\n')], { type: 'text/csv' }), filename);
 }
@@ -1985,7 +2009,7 @@ function buildRoundTex(pairs, { roundNumber = '', fullDocument = true } = {}) {
   for (const pair of pairs) {
     lines.push('\\begin{center} \\textbf{TOSS-UP} \\end{center}', '');
     lines.push(`${n}) ${questionToTex(pair.tu)}`, '');
-    lines.push('\\begin{center} \\textbf{BONUS} \\end{center}', '');
+    lines.push(`\\begin{center} \\textbf{${pair.b.tub === 'VB' ? 'VISUAL BONUS' : 'BONUS'}} \\end{center}`, '');
     lines.push(`${n}) ${questionToTex(pair.b)}`, '');
     lines.push(n % 2 === 0 ? '\\pagebreak' : '\\hrulefill', '');
     n++;
@@ -2202,19 +2226,14 @@ async function migrateLegacyDrafts() {
 }
 
 // ── Compile: editing and reviewing questions in place ─────────────────────────────
-// Everyone can work in the Compile view, but question permissions don't change:
-// admins edit any question directly, authors edit their own (until finalized),
-// and everyone else reviews / suggests edits through the normal review flow.
-// Anyone may edit a question that isn't finalized; finalized ones are admin-only.
-function canEditDirectly(q) {
-  return app.user.role === 'admin' || q.state !== 'finalized';
-}
-
+// Any approved member may edit any question, finalized or not. Authors edit
+// their own unfinalized questions in the normal editor; everything else goes
+// through the peer editor, which logs the edit in the history and never changes
+// the question's state (a finalized question stays finalized).
 function editFromCompile(q) {
   if (q.writerUid === app.user.uid && q.state !== 'finalized') return openEditor(q);
   if (app.user.role === 'admin' && q.state === 'finalized') return openAdminEditor(q);
-  if (q.state !== 'finalized') return openPeerEditor(q);
-  return reviewFromCompile(q);
+  return openPeerEditor(q);
 }
 
 // Edit someone else's question. The person chooses: save the change directly
@@ -2252,7 +2271,7 @@ function openPeerEditor(q) {
       answerLine: q.type === 'SA' ? d.answerLine : null,
       difficulty: d.difficulty,
     });
-    const extra = ['tub', 'subject', 'subcat', 'type', 'source'].filter((k) => (d[k] || '') !== (q[k] || ''));
+    const extra = ['tub', 'subject', 'subcat', 'type', 'source', 'imageUrl'].filter((k) => (d[k] || '') !== (q[k] || ''));
     if (!Object.keys(payload).length) {
       toast(extra.length ? 'Suggestions can only carry the text, choices, answer and difficulty — save directly to change the other fields.' : 'Make an edit first.', 'warn');
       return;
@@ -2293,7 +2312,7 @@ function reviewFromCompile(q) {
     live.appendChild(suggestionsSection(cur, false));
   });
   const note = q.state === 'finalized'
-    ? 'This question is finalized — only an admin can change it now.'
+    ? 'This question is finalized — use ✎ Edit to change it (it stays finalized).'
     : `This question isn’t in the review queue (${(STATE_META[q.state]?.label || q.state).toLowerCase()}), but you can still suggest an edit for the author.`;
   const body = el('div', {}, [
     el('p', { class: 'muted sm', text: note }),
@@ -2614,16 +2633,26 @@ function viewCompile() {
     flushSave(); // save now (not debounced) so the claim is backed by the draft right away
     return null;
   };
+  // Visual Bonuses only fill the Bonus slot, and only in rounds 12–14.
+  const visualRound = () => T.isVisualBonusRound(titleInp.value);
+  const vbBlocker = (q, role) => {
+    if (q.tub !== 'VB') return null;
+    if (role === 'tu') return `#${q.humanId} is a Visual Bonus — it can only go in a Bonus slot.`;
+    if (!visualRound()) return `#${q.humanId} is a Visual Bonus — those only go in rounds ${T.VISUAL_BONUS_ROUNDS.join(', ')}.`;
+    return null;
+  };
   // Put `q` into one specific slot.
   const placeInto = (slot, role, q) => claimAndPlace(q, role, () => {
     if (!slot || !slots.includes(slot)) return 'That slot no longer exists in this draft.';
     if (slot.subject !== q.subject) return `#${q.humanId} is ${q.subject || 'missing a subject'}, but that slot is ${slot.subject}.`;
+    const vb = vbBlocker(q, role); if (vb) return vb;
     if (slot[role]) return 'Someone already filled that slot.';
     return slot;
   });
   // Put `q` into the first open slot of `role` whose subject matches.
   const placeNext = (q, role) => claimAndPlace(q, role, () =>
-    slots.find((s) => s.subject === q.subject && s[role] == null)
+    vbBlocker(q, role)
+    || slots.find((s) => s.subject === q.subject && s[role] == null)
     || `No open ${role === 'tu' ? 'Toss-up' : 'Bonus'} slot for ${q.subject || 'that subject'}.`);
   const assign = async (q, role) => { const err = await placeNext(q, role); if (err) toast(err, 'warn'); };
 
@@ -2636,7 +2665,7 @@ function viewCompile() {
   const openPicker = (slot, role) => {
     const key = slot.key;
     const roleLabel = role === 'tu' ? 'Toss-up' : 'Bonus';
-    const wantTub = role === 'tu' ? 'TU' : 'B';
+    const wantTubs = role === 'tu' ? ['TU'] : visualRound() ? ['B', 'VB'] : ['B'];
     const pf = { status: 'all', onlyRole: true, q: '' };
     const statusPick = el('select', { class: 'inp sm' });
     fillSelect(statusPick, [
@@ -2652,7 +2681,7 @@ function viewCompile() {
       const used = usedIds(); const taken = otherDraftUse();
       const needle = pf.q.toLowerCase();
       const rows = all.filter((q) => q.subject === slot.subject && !used.has(q.id) && !taken.has(q.id)
-        && (!pf.onlyRole || q.tub === wantTub)
+        && (!pf.onlyRole || wantTubs.includes(q.tub))
         && (pf.status === 'all' || (pf.status === 'finalized' ? q.state === 'finalized' : q.state !== 'finalized'))
         && (!needle || (q.questionText || '').toLowerCase().includes(needle) || (q.answerLine || '').toLowerCase().includes(needle)));
       count.textContent = `${rows.length} available`;
@@ -2719,7 +2748,7 @@ function viewCompile() {
         const q = byId.get(created.id) || created;
         const what = submitted ? 'submitted for review' : 'saved as a draft';
         if (activeId !== draftId) { toast(`#${q.humanId} ${what}. You switched drafts, so it wasn’t placed — find it in the pool.`, 'warn'); return; }
-        const r = slot ? role : (q.tub === 'B' ? 'b' : 'tu');
+        const r = slot ? role : (q.tub === 'B' || q.tub === 'VB' ? 'b' : 'tu');
         const target = key ? findSlot(key) : null;
         const err = target && target.subject === q.subject && !target[r] ? await placeInto(target, r, q) : await placeNext(q, r);
         if (err) {
@@ -2777,7 +2806,7 @@ function viewCompile() {
             ]
           : [
               el('button', { class: 'btn ghost xs', text: 'View', onclick: () => modal(`Question #${q.humanId}`, questionDetail(q), { wide: true }) }),
-              canEditDirectly(q) ? el('button', { class: 'btn ghost xs', text: '✎', title: 'Edit #' + q.humanId, onclick: () => editFromCompile(q) }) : null,
+              el('button', { class: 'btn ghost xs', text: '✎', title: 'Edit #' + q.humanId, onclick: () => editFromCompile(q) }),
               el('button', { class: 'btn ghost xs', text: '⚖', title: 'Review / suggest edits for #' + q.humanId, onclick: () => reviewFromCompile(q) }),
               el('button', { class: 'btn ghost xs', text: '→ TU', title: 'Add as the next open Toss-up for ' + q.subject, onclick: () => assign(q, 'tu') }),
               el('button', { class: 'btn ghost xs', text: '→ B', title: 'Add as the next open Bonus for ' + q.subject, onclick: () => assign(q, 'b') }),
@@ -2848,7 +2877,8 @@ function viewCompile() {
       );
       return node;
     }
-    const mismatch = (role === 'tu' && q.tub !== 'TU') || (role === 'b' && q.tub !== 'B');
+    const mismatch = (role === 'tu' && q.tub !== 'TU') || (role === 'b' && q.tub !== 'B' && q.tub !== 'VB');
+    const vbOutOfRound = q.tub === 'VB' && role === 'b' && !visualRound();
     const alsoIn = otherDraftUse().get(q.id); // a clash from an older/concurrent edit
     const twice = dupeIds().has(q.id);
     node.setAttribute('draggable', 'true');
@@ -2865,11 +2895,13 @@ function viewCompile() {
         el('span', { class: 'chip subtle', text: '#' + q.humanId }),
         q.difficulty ? el('span', { class: 'chip subtle', text: 'D' + q.difficulty }) : null,
         mismatch ? el('span', { class: 'chip warn', title: `Written as ${q.tub}`, text: 'written ' + q.tub }) : null,
+        q.tub === 'VB' && !mismatch && !vbOutOfRound ? el('span', { class: 'chip subtle', text: 'VB' }) : null,
+        vbOutOfRound ? el('span', { class: 'chip danger', title: `Visual Bonuses only go in rounds ${T.VISUAL_BONUS_ROUNDS.join(', ')}`, text: 'VB not allowed in this round' }) : null,
         q.state !== 'finalized' ? el('span', { class: 'chip warn', title: 'Not finalized yet — ' + (STATE_META[q.state]?.label || q.state), text: 'not final' }) : null,
         twice ? el('span', { class: 'chip danger', title: 'This question is placed more than once in this round — remove the extra', text: 'twice in round' }) : null,
         alsoIn ? el('span', { class: 'chip danger', title: 'Also placed in round draft “' + alsoIn + '” — remove it from one of them', text: 'also in ' + alsoIn }) : null,
         el('span', { style: 'margin-left:auto; display:flex; gap:2px' }, [
-          canEditDirectly(q) ? el('button', { class: 'icon-btn sm', text: '✎', title: 'Edit #' + q.humanId, onclick: () => editFromCompile(q) }) : null,
+          el('button', { class: 'icon-btn sm', text: '✎', title: 'Edit #' + q.humanId, onclick: () => editFromCompile(q) }),
           el('button', { class: 'icon-btn sm', text: '⚖', title: 'Review / suggest edits for #' + q.humanId, onclick: () => reviewFromCompile(q) }),
           el('button', { class: 'icon-btn sm', text: '✕', title: 'Remove from the round (the question itself is kept)', onclick: () => { slot[role] = null; redraw(); } }),
         ]),
@@ -3248,7 +3280,7 @@ function viewCompile() {
       el('span', { class: 'pv-num', text: n + ')' }),
       el('span', { class: 'pv-subj', html: `${escapeHtml(q.subject)} — <em>${q.type === 'SA' ? 'Short Answer' : 'Multiple Choice'}</em>` }),
       el('span', { style: 'margin-left:auto; display:flex; gap:2px' }, [
-        canEditDirectly(q) ? el('button', { class: 'icon-btn sm', text: '✎', title: 'Edit #' + q.humanId, onclick: () => editFromCompile(q) }) : null,
+        el('button', { class: 'icon-btn sm', text: '✎', title: 'Edit #' + q.humanId, onclick: () => editFromCompile(q) }),
         el('button', { class: 'icon-btn sm', text: '⚖', title: 'Review / suggest edits for #' + q.humanId, onclick: () => reviewFromCompile(q) }),
       ]),
     ]);
@@ -3295,7 +3327,7 @@ function viewCompile() {
   const titleInp = el('input', { class: 'inp sm', value: '1', placeholder: 'e.g. 3', style: 'width:80px' });
   const shuffleChk = el('input', { type: 'checkbox', checked: true });
   const fullDocChk = el('input', { type: 'checkbox', checked: true });
-  titleInp.addEventListener('input', queueSave);
+  titleInp.addEventListener('input', () => { queueSave(); drawRound(); }); // redraw: VB slots depend on the round number
   shuffleChk.addEventListener('change', queueSave);
   fullDocChk.addEventListener('change', queueSave);
 

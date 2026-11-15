@@ -5,7 +5,21 @@
 export const TUB = [
   { value: 'TU', label: 'Toss-Up (TU)' },
   { value: 'B', label: 'Bonus (B)' },
+  { value: 'VB', label: 'Visual Bonus (VB)' },
 ];
+
+// Visual Bonuses: always Short Answer (every part and its answer go in the one
+// text box / answer line), carry a Google Slides link to the image, and may only
+// fill the Bonus slot of these rounds in Compile.
+export const VISUAL_BONUS_ROUNDS = [12, 13, 14];
+
+export function isVisualBonusRound(roundNumber) {
+  return VISUAL_BONUS_ROUNDS.includes(Number(String(roundNumber ?? '').trim()));
+}
+
+export function isGoogleSlidesLink(url) {
+  return /^https:\/\/docs\.google\.com\/presentation\/\S+$/.test(String(url || '').trim());
+}
 
 export const TYPES = [
   { value: 'MC', label: 'Multiple Choice (MC)' },

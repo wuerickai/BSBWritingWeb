@@ -180,6 +180,7 @@ export async function createQuestion(data) {
     mcAnswerText: data.mcAnswerText || '',
     difficulty: data.difficulty || null,
     source: data.source || '',
+    imageUrl: data.imageUrl || '',
     writerUid: u.uid,
     writerName: data.writerName || u.displayName || u.email,
     writerInitials: (data.writerInitials || u.initials || '').toUpperCase(),
@@ -228,9 +229,8 @@ export async function adminEdit(id, patch) {
 // Edit of someone else's question by any approved member (mirrors firebase.js).
 export async function peerEdit(id, patch) {
   const u = requireUser();
-  const allowed = ['tub', 'subject', 'subcat', 'type', 'questionText', 'answerLine', 'choices', 'mcAnswer', 'mcAnswerText', 'difficulty', 'source'];
+  const allowed = ['tub', 'subject', 'subcat', 'type', 'questionText', 'answerLine', 'choices', 'mcAnswer', 'mcAnswerText', 'difficulty', 'source', 'imageUrl'];
   return mutate(id, (q) => {
-    if (q.state === 'finalized') throw new Error('Finalized questions can only be edited by an admin.');
     for (const k of allowed) if (k in patch) q[k] = patch[k];
     q.history = q.history || [];
     q.history.push({ at: now(), byUid: u.uid, byName: u.displayName || u.email, action: 'peer_edited', comment: '', statusAt: q.status });
@@ -429,7 +429,7 @@ export async function bulkImport(questions, owner) {
       choices: data.choices || { W: '', X: '', Y: '', Z: '' }, mcAnswer: data.mcAnswer || '',
       mcAnswerText: data.type === 'MC' && data.mcAnswer && data.choices?.[data.mcAnswer]
         ? allCapsPreservingLatex(data.choices[data.mcAnswer]) : '',
-      difficulty: data.difficulty ?? null, source: data.source || '',
+      difficulty: data.difficulty ?? null, source: data.source || '', imageUrl: data.imageUrl || '',
       writerUid: owner.uid, writerName: owner.displayName || owner.email,
       writerInitials: (data.writerInitials || owner.initials || '').toUpperCase(),
       status: 1, state: 'in_review',
