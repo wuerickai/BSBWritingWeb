@@ -2774,6 +2774,10 @@ function viewCompile() {
       && (!filters.tub || q.tub === filters.tub)
       && (!filters.difficulty || String(q.difficulty) === filters.difficulty)
       && (!filters.q || (q.questionText || '').toLowerCase().includes(filters.q.toLowerCase()) || (q.answerLine || '').toLowerCase().includes(filters.q.toLowerCase())));
+    // Questions already placed in a round (this draft or another) sink to the
+    // bottom; the stable sort keeps the existing order within each group.
+    const placed = (q) => (used.has(q.id) || taken.has(q.id) ? 1 : 0);
+    rows.sort((a, b) => placed(a) - placed(b));
     const noun = filters.status === 'finalized' ? 'finalized' : filters.status === 'unfinalized' ? 'unfinalized' : 'question' + (rows.length === 1 ? '' : 's');
     poolCount.textContent = `${rows.length} ${noun}`;
     clear(poolList);
