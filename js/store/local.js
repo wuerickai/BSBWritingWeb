@@ -525,6 +525,19 @@ export async function reorderCompileDrafts(ids) {
   emitCompile();
 }
 
+// Restore round drafts from a backup: each saved draft replaces the current one
+// with the same id (or comes back if it was deleted); drafts made since the
+// backup are left alone. Mirrors firebase.js.
+export async function restoreCompileDrafts(drafts) {
+  if (!drafts.length) return 0;
+  const arr = read(K_COMPILE, []);
+  const byId = new Map(arr.map((d) => [d.id, d]));
+  for (const d of drafts) byId.set(d.id, structuredClone(d));
+  write(K_COMPILE, [...byId.values()]);
+  emitCompile();
+  return drafts.length;
+}
+
 export async function deleteCompileDraft(id) {
   write(K_COMPILE, read(K_COMPILE, []).filter((d) => d.id !== id));
   emitCompile();

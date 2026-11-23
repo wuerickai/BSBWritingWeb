@@ -584,6 +584,23 @@ export async function reorderCompileDrafts(ids) {
   await batch.commit();
 }
 
+// Restore round drafts from a backup: each saved draft overwrites the current
+// one with the same id in full (or comes back if it was deleted); drafts made
+// since the backup are left alone. Their placement claims need no restoring — a
+// claim holds whenever its draft contains the question.
+export async function restoreCompileDrafts(drafts) {
+  requireUser();
+  let batch = F.writeBatch(db);
+  let n = 0;
+  for (const d of drafts) {
+    const { id, ...data } = d;
+    batch.set(draftRef(id), { ...data, kind: 'compileDraft', draftId: id });
+    if (++n % 400 === 0) { await batch.commit(); batch = F.writeBatch(db); }
+  }
+  if (n % 400) await batch.commit();
+  return n;
+}
+
 export async function deleteCompileDraft(id) {
   await F.deleteDoc(draftRef(id));
 }

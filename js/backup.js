@@ -1,7 +1,11 @@
 // ────────────────────────────────────────────────────────────────────────────
-//  Periodic local backups of all questions.
-//  Snapshot DATA is stored in IndexedDB (large quota); a small INDEX of
-//  {at, count} lives in localStorage so listing is cheap. Snapshots are taken on
+//  Periodic local backups of all questions and compiled round drafts.
+//  Snapshot DATA ({ at, count, draftCount, data: questions[], drafts: [] }) is
+//  stored in IndexedDB (large quota); a small INDEX of {at, count, draftCount}
+//  lives in localStorage so listing is cheap. Snapshots from before rounds were
+//  included have no `drafts` and read back as questions-only.
+//  Placement claims aren't saved: a claim holds whenever its draft contains the
+//  question, so restoring the drafts brings their claims back with them. Snapshots are taken on
 //  an interval, after imports/mutations (debounced), and before the page unloads.
 // ────────────────────────────────────────────────────────────────────────────
 
@@ -45,25 +49,39 @@ async function delSnapshot(at) {
 }
 
 let _getAll = () => [];
+let _getDrafts = () => [];
 let _lastHash = '';
 let _timer = null;
 let _debounce = null;
 
-export function configure(getAll) { _getAll = getAll; }
+export function configure(getAll, getDrafts) {
+  _getAll = getAll;
+  if (getDrafts) _getDrafts = getDrafts;
+}
+
+const sumMod = (arr, f) => arr.reduce((h, x) => (h + f(x)) % 2147483647, 0);
+function fingerprint(data, drafts) {
+  // Reordering rounds changes only `order`, not updatedAt, so include it.
+  return data.length + ':' + sumMod(data, (q) => q.updatedAt || 0)
+    + '|' + drafts.length + ':' + sumMod(drafts, (d) => d.updatedAt || 0)
+    + ':' + drafts.map((d) => d.id + '@' + (d.order ?? '')).join(',');
+}
 
 export async function snapshotNow({ force = false } = {}) {
-  let data;
+  let data, drafts;
   try { data = _getAll() || []; } catch { return null; }
+  try { drafts = _getDrafts() || []; } catch { drafts = []; }
   if (!data.length && !force) return null;
-  const hash = data.length + ':' + data.reduce((h, q) => (h + (q.updatedAt || 0)) % 2147483647, 0);
+  const hash = fingerprint(data, drafts);
   if (hash === _lastHash && !force) return null; // nothing changed
   _lastHash = hash;
-  const at = Date.now();
-  const snap = { at, count: data.length, data };
+  let at = Date.now();
+  const idx = idxRead();
+  while (idx.some((s) => s.at === at)) at += 1; // keys must be unique
+  const snap = { at, count: data.length, draftCount: drafts.length, data, drafts };
   try {
     await putSnapshot(snap);
-    const idx = idxRead();
-    idx.push({ at, count: data.length });
+    idx.push({ at, count: data.length, draftCount: drafts.length });
     // prune oldest beyond keep
     idx.sort((a, b) => a.at - b.at);
     while (idx.length > (CONFIG.backup?.keep || 20)) {
@@ -82,8 +100,8 @@ export function markDirty() {
   _debounce = setTimeout(() => snapshotNow(), 4000);
 }
 
-export function start(getAll) {
-  configure(getAll);
+export function start(getAll, getDrafts) {
+  configure(getAll, getDrafts);
   stop();
   const mins = CONFIG.backup?.intervalMinutes || 10;
   _timer = setInterval(() => snapshotNow(), Math.max(1, mins) * 60 * 1000);
@@ -92,9 +110,31 @@ export function start(getAll) {
 }
 export function stop() { if (_timer) clearInterval(_timer); _timer = null; }
 
+// → { at, questions, drafts } (drafts is [] for snapshots that predate them), or null.
 export async function getSnapshotData(at) {
   const s = await getSnapshot(at);
-  return s ? s.data : null;
+  return s ? { at: s.at, questions: s.data || [], drafts: s.drafts || [] } : null;
+}
+
+// ── Backup files (download / restore from file) ──────────────────────────────
+export function toBackupFile({ at = Date.now(), questions = [], drafts = [] }) {
+  return { format: 'sbq-backup', version: 2, at, questions, drafts };
+}
+
+// Accepts a file made by toBackupFile, or an older download (a bare array of
+// questions). Returns { at, questions, drafts }; throws if it isn't a backup.
+export function parseBackup(json) {
+  let questions, drafts = [], at = null;
+  if (Array.isArray(json)) questions = json;
+  else if (json && json.format === 'sbq-backup' && Array.isArray(json.questions)) {
+    questions = json.questions;
+    drafts = Array.isArray(json.drafts) ? json.drafts : [];
+    at = json.at || null;
+  } else throw new Error('This file is not a question bank backup.');
+  const hasId = (x) => x && typeof x === 'object' && typeof x.id === 'string' && x.id;
+  if (!questions.every(hasId)) throw new Error('This backup has questions without an ID.');
+  if (!drafts.every(hasId)) throw new Error('This backup has rounds without an ID.');
+  return { at, questions, drafts };
 }
 
 export function downloadJson(data, name) {

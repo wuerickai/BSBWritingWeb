@@ -98,8 +98,10 @@ Then: **Settings → Pages → Source: Deploy from a branch → `main` / root**.
 
 ## Backups
 
-- While the app is open, all questions are snapshotted to this browser's IndexedDB every `backup.intervalMinutes` minutes (keeping the last `backup.keep`), and after each change.
-- **Admin → Backups** lists snapshots; you can **Download** any as JSON (off-device copy) or **Restore** one.
+- While the app is open, all questions and compiled round drafts (including their shared order) are snapshotted to this browser's IndexedDB every `backup.intervalMinutes` minutes (keeping the last `backup.keep`), and after each change. Snapshots taken before rounds were included show "(no rounds)".
+- **Admin → Backups** lists snapshots; you can **Download** any as JSON (off-device copy), **Restore** one, or **Restore from file** using a downloaded backup (older question-only downloads work too).
+- Restoring overwrites questions and rounds that have the same ID, and brings back deleted ones. Anything created after the backup is kept. Placement claims aren't stored separately; a restored round claims the questions it holds again.
+- Users and roles are not part of the backup.
 - With the Firebase backend your data also lives server-side; the local snapshots are an extra safety net.
 - The Firebase backend also caches questions in IndexedDB (Firestore's persistent cache) so reloads only re-read changed documents. That cache stays in the browser after sign-out, so avoid using shared computers or clear site data afterwards. For scheduled server-side exports, see Firestore's managed export/backup.
 
@@ -129,7 +131,8 @@ js/taxonomy.js        Dropdown options
 js/latex.js           LaTeX segmenting, rendering, validation
 js/text.js            Similarity (duplicate detection) + word-level diff (suggestions)
 js/csv.js             CSV parsing/mapping for bulk import
-js/backup.js          Periodic IndexedDB snapshots (list / restore / download)
+js/backup.js          Periodic IndexedDB snapshots of questions + rounds (list / restore / download)
+tests/                Node tests for backups (`node --test tests/`)
 js/ui.js              DOM helpers (elements, modals, toasts)
 js/app.js             Router + all views (Write, Mine, Review, Finalized, Admin)
 js/store/index.js     Picks the backend from config

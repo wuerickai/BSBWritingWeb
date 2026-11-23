@@ -14,7 +14,7 @@ import {
   el, clear, fillSelect, toast, modal, confirmDialog, promptDialog, fmtDate, stateBadge, debounce, STATE_META,
 } from './ui.js';
 
-const app = { user: null, unsub: null, allQuestions: [], allUnsub: null };
+const app = { user: null, unsub: null, allQuestions: [], allUnsub: null, allDrafts: [], draftsUnsub: null };
 const view = () => document.getElementById('view');
 const ROUTES = ['write', 'mine', 'mine-finalize', 'review', 'finalized', 'stats', 'graveyard', 'compile', 'admin'];
 
@@ -93,7 +93,8 @@ function navigate(r) { location.hash = '#/' + r; }
 function cleanupSub() { if (app.unsub) { try { app.unsub(); } catch {} app.unsub = null; } }
 
 // A session-long subscription to ALL questions, powering duplicate detection and
-// periodic backups. Started once the user is ready; torn down on sign-out.
+// periodic backups, plus one to the compiled round drafts so backups include
+// them. Started once the user is ready; torn down on sign-out.
 let _backupStarted = false;
 function startGlobal() {
   if (app.allUnsub) return;
@@ -103,10 +104,16 @@ function startGlobal() {
     Backup.markDirty();
     document.dispatchEvent(new CustomEvent('sbq-allquestions'));
   });
-  if (!_backupStarted) { Backup.start(() => app.allQuestions); _backupStarted = true; }
+  app.draftsUnsub = S().watchCompileDrafts((rows) => {
+    app.allDrafts = rows;
+    Backup.markDirty();
+  });
+  if (!_backupStarted) { Backup.start(() => app.allQuestions, () => app.allDrafts); _backupStarted = true; }
 }
 function stopGlobal() {
   if (app.allUnsub) { try { app.allUnsub(); } catch {} app.allUnsub = null; }
+  if (app.draftsUnsub) { try { app.draftsUnsub(); } catch {} app.draftsUnsub = null; }
+  app.allDrafts = [];
   Backup.stop(); _backupStarted = false;
   app.allQuestions = [];
   app.allLoaded = false;
@@ -3734,19 +3741,37 @@ function adminImport(host) {
 function adminBackups(host) {
   clear(host);
   const listHost = el('div', { class: 'table-host' });
+  const plural = (n, w) => `${n} ${w}${n === 1 ? '' : 's'}`;
+  const sizeText = (s) => plural(s.count, 'question') + (s.draftCount != null ? ` · ${plural(s.draftCount, 'round')}` : ' (no rounds)');
+  const stamp = (at) => new Date(at).toISOString().slice(0, 19).replace(/:/g, '-');
+
+  // Restore = upsert: saved questions and rounds overwrite the current ones with
+  // the same ID (or come back if deleted); anything newer is left alone.
+  const restore = async (snap, when) => {
+    const { questions, drafts } = snap;
+    const what = drafts.length ? `${plural(questions.length, 'question')} and ${plural(drafts.length, 'round')}` : plural(questions.length, 'question');
+    const msg = `Restore ${what} from ${when}? Existing questions${drafts.length ? ' and rounds' : ''} with the same ID will be overwritten. Anything created since is kept.`
+      + (drafts.length ? '' : ' This backup has no rounds, so rounds are left as they are.');
+    if (!(await confirmDialog(msg, { confirmText: 'Restore', danger: true }))) return;
+    try {
+      if (questions.length) await S().bulkUpsert(questions);
+      if (drafts.length) await S().restoreCompileDrafts(drafts);
+      toast('Backup restored.', 'success');
+    } catch (e) { console.error('restore', e); toast(explainError(e), 'error'); }
+  };
+
   const refresh = () => {
     const snaps = Backup.listSnapshots();
     clear(listHost);
     if (!snaps.length) { listHost.appendChild(emptyState('No backups yet. One is taken automatically every few minutes.')); return; }
     const body = el('tbody', {}, snaps.map((s) => el('tr', {}, [
       el('td', { text: fmtDate(s.at) }),
-      el('td', { text: s.count + ' questions' }),
+      el('td', { text: sizeText(s) }),
       el('td', {}, [
-        el('button', { class: 'btn ghost xs', text: '⬇ Download', onclick: async () => { const data = await Backup.getSnapshotData(s.at); if (data) Backup.downloadJson(data, `sbq-backup-${new Date(s.at).toISOString().slice(0, 19)}.json`); } }),
+        el('button', { class: 'btn ghost xs', text: '⬇ Download', onclick: async () => { const snap = await Backup.getSnapshotData(s.at); if (snap) Backup.downloadJson(Backup.toBackupFile(snap), `sbq-backup-${stamp(s.at)}.json`); } }),
         el('button', { class: 'btn ghost xs', text: '↺ Restore', style: 'margin-left:6px', onclick: async () => {
-          if (!(await confirmDialog(`Restore ${s.count} questions from ${fmtDate(s.at)}? Existing questions with the same ID will be overwritten.`, { confirmText: 'Restore', danger: true }))) return;
-          const data = await Backup.getSnapshotData(s.at);
-          if (data) { await S().bulkUpsert(data); toast('Backup restored.', 'success'); }
+          const snap = await Backup.getSnapshotData(s.at);
+          if (snap) await restore(snap, fmtDate(s.at));
         } }),
       ]),
     ])));
@@ -3758,11 +3783,24 @@ function adminBackups(host) {
   // stop listening when leaving the view
   app.unsub = () => document.removeEventListener('sbq-backup', onBackup);
 
+  const fileInp = el('input', { type: 'file', accept: '.json,application/json', style: 'display:none' });
+  fileInp.addEventListener('change', async () => {
+    const f = fileInp.files[0];
+    fileInp.value = '';
+    if (!f) return;
+    let snap;
+    try { snap = Backup.parseBackup(JSON.parse(await f.text())); }
+    catch (e) { toast(e instanceof SyntaxError ? 'That file is not valid JSON.' : e.message, 'error'); return; }
+    await restore(snap, snap.at ? `${fmtDate(snap.at)} (${f.name})` : f.name);
+  });
+
   host.appendChild(el('div', { class: 'card' }, [
-    el('p', { class: 'muted', text: `Questions are automatically snapshotted to this browser every ${CONFIG.backup.intervalMinutes} minutes (keeping the last ${CONFIG.backup.keep}). Download a snapshot to keep an off-device copy, or restore one if something goes wrong.` }),
+    el('p', { class: 'muted', text: `Questions and compiled rounds are automatically snapshotted to this browser every ${CONFIG.backup.intervalMinutes} minutes (keeping the last ${CONFIG.backup.keep}). Download a snapshot to keep an off-device copy, or restore one (from this list or a downloaded file) if something goes wrong.` }),
     el('div', { class: 'row-end gap', style: 'margin-bottom:14px' }, [
-      el('button', { class: 'btn ghost', text: '⬇ Download all current', onclick: () => Backup.downloadJson(app.allQuestions, `sbq-questions-${new Date().toISOString().slice(0, 10)}.json`) }),
+      el('button', { class: 'btn ghost', text: '⬇ Download all current', onclick: () => Backup.downloadJson(Backup.toBackupFile({ questions: app.allQuestions, drafts: app.allDrafts }), `sbq-backup-${stamp(Date.now())}.json`) }),
+      el('button', { class: 'btn ghost', text: '⬆ Restore from file…', onclick: () => fileInp.click() }),
       el('button', { class: 'btn primary', text: '＋ Back up now', onclick: async () => { await Backup.snapshotNow({ force: true }); refresh(); toast('Backup created.', 'success'); } }),
+      fileInp,
     ]),
     listHost,
   ]));
